@@ -1,0 +1,9 @@
+
+[package]
+name = "hex-net-sim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hex-net-core = {workspace = true}
+hex-net-io = {workspace = true}
