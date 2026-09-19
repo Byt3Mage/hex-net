@@ -75,7 +75,6 @@ pub enum Action {
 pub enum DropReason {
     Malformed,
     UnknownConnection,
-    /// Failed decryption, duplicate, or replayed.
     Rejected,
     RateLimited,
     Handshake(HandshakeError),
@@ -222,13 +221,13 @@ impl Endpoint {
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
+    pub fn num_connections(&self) -> usize {
         self.connections.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.connections.is_empty()
+        self.num_connections() == 0
     }
 
     /// Issues a resume ticket to a connected player. Call periodically so the
@@ -268,8 +267,8 @@ impl Endpoint {
             PacketKind::Payload => self.route_payload(ctx, from, buf, len, on_message),
             PacketKind::Request => self.handle_request(ctx, from, buf, len, out),
             PacketKind::Response => self.handle_response(ctx, from, buf, len),
-            // Servers never receive challenges.
             PacketKind::Challenge => {
+                // Servers never receive challenges.
                 ctx.counters.inc(Counter::PacketsMalformed);
                 Action::Dropped(DropReason::Malformed)
             }
@@ -429,8 +428,6 @@ impl Endpoint {
             _ => Err(HandshakeError::NoSession),
         }
     }
-
-    // --------------------------------------------------------------- transmit
 
     /// Produces one packet per connection that has something to send.
     ///

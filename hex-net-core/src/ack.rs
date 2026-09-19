@@ -259,35 +259,26 @@ impl<const N: usize> Delivery<N> {
     /// Marks one packet delivered. Returns true only when this call confirmed a
     /// packet still in flight, which is the only case fit to sample RTT.
     fn resolve(&mut self, sequence: Sequence, notify: &mut impl FnMut(Delivered)) -> bool {
-        let spurious = {
-            let Some(record) = self.sent.get_mut(sequence) else {
-                return false;
-            };
-
-            match record.state {
-                // Acknowledgement bitfields repeat across many headers; each
-                // packet is reported once.
-                State::Acked => return false,
-                State::Lost => {
-                    record.state = State::Acked;
-                    true
-                }
-                State::InFlight => {
-                    record.state = State::Acked;
-                    let size = record.size;
-                    self.bytes_in_flight = self.bytes_in_flight.saturating_sub(size as u32);
-                    notify(Delivered::yes(sequence));
-                    return true;
-                }
-            }
+        let Some(record) = self.sent.get_mut(sequence) else {
+            return false;
         };
 
-        if spurious {
-            // Its contents were already resent, and timing from a packet
-            // written off as lost is not trustworthy.
-            self.spurious_losses += 1;
+        match record.state {
+            State::Acked => false,
+            State::Lost => {
+                // Its contents were already resent, and timing from a packet
+                // written off as lost is not trustworthy.
+                record.state = State::Acked;
+                self.spurious_losses += 1;
+                false
+            }
+            State::InFlight => {
+                record.state = State::Acked;
+                self.bytes_in_flight = self.bytes_in_flight.saturating_sub(record.size as u32);
+                notify(Delivered::yes(sequence));
+                true
+            }
         }
-        false
     }
 
     /// Declares overdue packets lost.
@@ -352,7 +343,7 @@ impl<const N: usize> Delivery<N> {
     fn advance_oldest(&mut self) {
         while self.oldest_unresolved <= self.largest_sent {
             match self.sent.get(self.oldest_unresolved) {
-                Some(record) if record.state == State::InFlight => break,
+                Some(Sent { state: State::InFlight, .. }) => break,
                 _ => self.oldest_unresolved = self.oldest_unresolved.next(),
             }
         }

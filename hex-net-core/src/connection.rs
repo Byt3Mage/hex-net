@@ -265,8 +265,6 @@ impl<R: Role> Connection<R> {
         }
     }
 
-    // ---------------------------------------------------------------- receive
-
     /// Processes one datagram. `buf[..len]` is decrypted in place, and
     /// `on_message` is called for each message it delivers, with a payload
     /// borrowed from that buffer.
@@ -391,7 +389,7 @@ impl<R: Role> Connection<R> {
     /// One packet per call: coalescing everything for a peer into a single
     /// datagram amortizes 28 bytes of IP and UDP overhead plus our header and
     /// the authentication tag.
-    pub fn poll_transmit(&mut self, ctx: &mut Ctx, buf: &mut Packet) -> Option<usize> {
+    pub fn poll_transmit(&mut self, ctx: &mut Ctx, out: &mut Packet) -> Option<usize> {
         if self.lifecycle == Lifecycle::Closed {
             return None;
         }
@@ -402,10 +400,10 @@ impl<R: Role> Connection<R> {
         let ticket = self.crypto.next_sequence();
         let sequence = ticket.sequence();
         let header = self.build_header(ctx.now, sequence);
-        let body = self.crypto.begin(&header, buf);
+        let body = self.crypto.begin(&header, out);
         let header_len = body.start;
 
-        let mut w = BitWriter::new(&mut buf[body]);
+        let mut w = BitWriter::new(&mut out[body]);
 
         // Control frames ignore the budget: acknowledgements and keepalives are
         // what let a constrained connection discover conditions improved, and a
@@ -423,7 +421,7 @@ impl<R: Role> Connection<R> {
             eliciting |= self.channels.write_frames(&mut w, &mut staged, channel_limit);
         }
 
-        if !eliciting && header.ack.is_none() {
+        if !eliciting && self.ack_pending.is_none() {
             // Nothing to say and no acknowledgement owed. Keepalives come from
             // the timer, which queues a ping.
             self.channels.on_packet_aborted(staged);
@@ -433,7 +431,7 @@ impl<R: Role> Connection<R> {
         let _ = FrameKind::Padding.write(&mut w);
         let body_end = header_len + w.finish();
 
-        let Ok(len) = self.crypto.encrypt(ticket, buf, header_len, body_end) else {
+        let Ok(len) = self.crypto.encrypt(ticket, out, header_len, body_end) else {
             self.channels.on_packet_aborted(staged);
             return None;
         };
@@ -517,8 +515,6 @@ impl<R: Role> Connection<R> {
         ok
     }
 
-    // ----------------------------------------------------------------- timers
-
     /// Runs loss detection, keepalives, the idle timeout, and the role's own
     /// timer work.
     pub fn handle_timeout(&mut self, ctx: &mut Ctx) {
@@ -532,13 +528,11 @@ impl<R: Role> Connection<R> {
             return;
         }
 
-        let channels = &mut self.channels;
-        let budget = &mut self.budget;
         let mut lost = 0u64;
         self.delivery.detect_lost(ctx.now, |event| {
             lost += 1;
-            budget.on_lost();
-            channels.on_delivery(event);
+            self.budget.on_lost();
+            self.channels.on_delivery(event);
         });
         ctx.counters.add(Counter::PacketsLost, lost);
 
@@ -667,8 +661,6 @@ impl Connection<Client> {
         self.ticket
     }
 }
-
-// ----------------------------------------------------------------- server
 
 impl Role for Server {
     fn split_keys(keys: &Keys) -> (Key, Key) {

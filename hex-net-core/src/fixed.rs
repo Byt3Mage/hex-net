@@ -7,7 +7,7 @@
 use core::ops::{Deref, DerefMut};
 
 /// A vector whose capacity is a compile-time constant.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct FixedVec<T: Copy, const CAP: usize> {
     items: [T; CAP],
     len: u32,

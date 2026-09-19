@@ -4,7 +4,7 @@
 //! receives at the address it claims, and every handshake packet is padded so a
 //! reply is never larger than the request.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use crate::bits::{BitReader, BitWriter, ReadError, WriteError};
@@ -31,9 +31,10 @@ pub const MAX_COOKIE: usize = MAX_TICKET + 32;
 
 const _: () = {
     // A change to MAX_USER_DATA fails the build rather than truncating a ticket
-    // at runtime. The ticket's fixed part is 90 bytes; a cookie adds at most 25.
+    // at runtime. The ticket's fixed part is 98 bytes. A cookie prefixes at
+    // most 27 for an IPv6 address with its family tag and port.
     assert!(MAX_TICKET >= (98 + MAX_USER_DATA));
-    assert!(MAX_COOKIE >= (MAX_TICKET + 25));
+    assert!(MAX_COOKIE >= (MAX_TICKET + 27));
     assert!(MAX_BLOB >= (MAX_COOKIE + 28));
 };
 
@@ -50,7 +51,7 @@ pub struct SessionId(pub u64);
 
 /// The client's credential: sealed by the backend for a new player, or by this
 /// server for a resuming one. Opaque to the client.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Ticket {
     pub expires_at: Timestamp,
     /// Unique per issued ticket. Lets the server recognise a retried handshake
@@ -144,7 +145,7 @@ impl Acceptor {
         let blob = handshake_blob(packet).ok_or(HandshakeError::Malformed)?;
 
         let mut plain = [0u8; MAX_COOKIE];
-        let len = crypto::encrypt_blob(&self.server_key, blob, &PROTOCOL_ID.to_le_bytes(), &mut plain)
+        let len = crypto::decrypt_blob(&self.server_key, blob, &PROTOCOL_ID.to_le_bytes(), &mut plain)
             .map_err(|_| HandshakeError::BadAuth)?;
 
         decode_cookie(&plain[..len])
@@ -229,53 +230,46 @@ fn encode_cookie(
 ) -> Result<usize, WriteError> {
     out[0..8].copy_from_slice(&now.as_nanos().to_le_bytes());
 
-    let mut len = 9;
-    match addr.ip() {
+    let mut at = match addr.ip() {
         IpAddr::V4(ip) => {
             out[8] = 4;
-            out[len..len + 4].copy_from_slice(&ip.octets());
-            len += 4;
+            out[9..13].copy_from_slice(&ip.octets());
+            13
         }
         IpAddr::V6(ip) => {
             out[8] = 6;
-            out[len..len + 16].copy_from_slice(&ip.octets());
-            len += 16;
+            out[9..25].copy_from_slice(&ip.octets());
+            25
         }
-    }
+    };
 
-    out[len..len + 2].copy_from_slice(&addr.port().to_le_bytes());
-    len += 2;
+    out[at..at + 2].copy_from_slice(&addr.port().to_le_bytes());
+    at += 2;
 
-    let plain = out[len..len + MAX_TICKET]
-        .as_mut_array()
-        .ok_or(WriteError::OutOfRange)?;
+    let plain = out[at..at + MAX_TICKET].as_mut_array().ok_or(WriteError::OutOfRange)?;
+    at += encode_ticket(ticket, plain)?;
 
-    len += encode_ticket(ticket, plain)?;
-
-    Ok(len)
+    Ok(at)
 }
 
 fn decode_cookie(bytes: &[u8]) -> Result<Cookie, HandshakeError> {
-    let slice = |from: usize, to: usize| bytes.get(from..to).ok_or(HandshakeError::Malformed);
+    let slice = |range| bytes.get(range).ok_or(HandshakeError::Malformed);
+    let issued = u64::from_le_bytes(slice(0..8)?.try_into().expect("checked length"));
 
-    let issued = u64::from_le_bytes(slice(0, 8)?.try_into().expect("checked length"));
-
-    let (ip, mut at): (IpAddr, usize) = match *bytes.get(8).ok_or(HandshakeError::Malformed)? {
+    let (ip, at) = match *bytes.get(8).ok_or(HandshakeError::Malformed)? {
         4 => {
-            let octets: [u8; 4] = slice(9, 13)?.try_into().expect("checked length");
-            (IpAddr::V4(Ipv4Addr::from(octets)), 13)
+            let octets: [u8; 4] = slice(9..13)?.try_into().expect("checked length");
+            (IpAddr::from(octets), 13)
         }
         6 => {
-            let octets: [u8; 16] = slice(9, 25)?.try_into().expect("checked length");
-            (IpAddr::V6(Ipv6Addr::from(octets)), 25)
+            let octets: [u8; 16] = slice(9..25)?.try_into().expect("checked length");
+            (IpAddr::from(octets), 25)
         }
         _ => return Err(HandshakeError::Malformed),
     };
 
-    let port = u16::from_le_bytes(slice(at, at + 2)?.try_into().expect("checked length"));
-    at += 2;
-
-    let ticket = decode_ticket(bytes.get(at..).ok_or(HandshakeError::Malformed)?)?;
+    let port = u16::from_le_bytes(slice(at..at + 2)?.try_into().expect("checked length"));
+    let ticket = decode_ticket(slice(at + 2..bytes.len())?)?;
 
     Ok(Cookie {
         issued_at: Timestamp::from_nanos(issued),

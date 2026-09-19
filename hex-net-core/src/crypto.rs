@@ -20,7 +20,7 @@ pub type Key = [u8; 32];
 ///
 /// Fixed for the session's life, including across resumes. The connection id
 /// forms half of every nonce, so a new id gives a disjoint nonce space.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Keys {
     pub client_to_server: Key,
     pub server_to_client: Key,
