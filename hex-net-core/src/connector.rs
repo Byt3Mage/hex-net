@@ -130,7 +130,7 @@ impl Connector {
         out: &mut Packet,
         on_message: OnMessage,
     ) -> Action {
-        // A client talks to exactly one server; anything else is noise or an
+        // A client talks to exactly one server. Anything else is noise or an
         // injection attempt.
         if from != self.server {
             ctx.counters.inc(Counter::PacketsUnknownConnection);
