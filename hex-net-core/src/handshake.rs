@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use crate::bits::{BitReader, BitWriter, ReadError, WriteError};
-use crate::crypto::{self, Blob, Key, Keys};
+use crate::crypto::{self, Key, Keys, MAX_BLOB};
 use crate::fixed::FixedVec;
 use crate::time::Timestamp;
 use crate::wire::{HANDSHAKE_LEN, PROTOCOL_ID, handshake_blob};
@@ -34,8 +34,13 @@ const _: () = {
     // at runtime. The ticket's fixed part is 90 bytes; a cookie adds at most 25.
     assert!(MAX_TICKET >= (98 + MAX_USER_DATA));
     assert!(MAX_COOKIE >= (MAX_TICKET + 25));
-    assert!(crate::crypto::MAX_BLOB >= (MAX_COOKIE + 28));
+    assert!(MAX_BLOB >= (MAX_COOKIE + 28));
 };
+
+/// An encrypted ticket as it travels. It is opaque to the client, presented
+/// unmodified. The same type carries a backend-issued connect ticket and a
+/// server-issued resume ticket, which differ only in who sealed them.
+pub type EncryptedTicket = FixedVec<u8, MAX_BLOB>;
 
 pub type UserData = FixedVec<u8, MAX_USER_DATA>;
 
@@ -125,9 +130,10 @@ impl Acceptor {
         ticket: &Ticket,
         out: &mut [u8],
     ) -> Result<usize, HandshakeError> {
-        let blob = encode_cookie(now, addr, ticket).map_err(|_| HandshakeError::Malformed)?;
+        let mut plain = [0u8; MAX_COOKIE];
+        let len = encode_cookie(now, addr, ticket, &mut plain).map_err(|_| HandshakeError::Malformed)?;
         let aad = PROTOCOL_ID.to_le_bytes();
-        crypto::encrypt_blob(&self.server_key, blob.as_slice(), &aad, out).map_err(|_| HandshakeError::Malformed)
+        crypto::encrypt_blob(&self.server_key, &plain[..len], &aad, out).map_err(|_| HandshakeError::Malformed)
     }
 
     /// Opens a cookie returned in a challenge response.
@@ -165,8 +171,7 @@ pub fn encrypt_ticket(key: &Key, ticket: &Ticket, out: &mut [u8]) -> Result<usiz
     crypto::encrypt_blob(key, &plain[..len], &aad, out).map_err(|_| HandshakeError::Malformed)
 }
 
-/// Returns the length written. `out` must be at least MAX_TICKET bytes, which is
-/// what makes the writes below infallible.
+/// Returns the length written. `out` must be at least MAX_TICKET bytes.
 fn encode_ticket(t: &Ticket, out: &mut [u8; MAX_TICKET]) -> Result<usize, WriteError> {
     let mut w = BitWriter::new(out);
 
@@ -215,35 +220,39 @@ fn decode_ticket(bytes: &[u8]) -> Result<Ticket, HandshakeError> {
     read(bytes).map_err(|_| HandshakeError::Malformed)
 }
 
-/// Layout: issued_at, address family, address, port, ticket.
-fn encode_cookie(now: Timestamp, addr: SocketAddr, ticket: &Ticket) -> Result<Blob<MAX_COOKIE>, WriteError> {
-    let mut data = [0u8; MAX_COOKIE];
-    data[0..8].copy_from_slice(&now.as_nanos().to_le_bytes());
+/// Layout: `[issued_at | address family | address | port | ticket]`
+fn encode_cookie(
+    now: Timestamp,
+    addr: SocketAddr,
+    ticket: &Ticket,
+    out: &mut [u8; MAX_COOKIE],
+) -> Result<usize, WriteError> {
+    out[0..8].copy_from_slice(&now.as_nanos().to_le_bytes());
 
     let mut len = 9;
     match addr.ip() {
         IpAddr::V4(ip) => {
-            data[8] = 4;
-            data[len..len + 4].copy_from_slice(&ip.octets());
+            out[8] = 4;
+            out[len..len + 4].copy_from_slice(&ip.octets());
             len += 4;
         }
         IpAddr::V6(ip) => {
-            data[8] = 6;
-            data[len..len + 16].copy_from_slice(&ip.octets());
+            out[8] = 6;
+            out[len..len + 16].copy_from_slice(&ip.octets());
             len += 16;
         }
     }
 
-    data[len..len + 2].copy_from_slice(&addr.port().to_le_bytes());
+    out[len..len + 2].copy_from_slice(&addr.port().to_le_bytes());
     len += 2;
 
-    let plain = data[len..len + MAX_TICKET]
+    let plain = out[len..len + MAX_TICKET]
         .as_mut_array()
         .ok_or(WriteError::OutOfRange)?;
 
     len += encode_ticket(ticket, plain)?;
 
-    Ok(Blob { data, len })
+    Ok(len)
 }
 
 fn decode_cookie(bytes: &[u8]) -> Result<Cookie, HandshakeError> {

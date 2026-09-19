@@ -5,14 +5,15 @@ use std::time::Duration;
 
 use crate::budget::BudgetConfig;
 use crate::channel::{ChannelSet, OnMessage};
-use crate::connection::{ClientRole, CloseReason, Connection, Event as ConnEvent, RecvError, ResumeTicket};
+use crate::connection::{ClientRole, CloseReason, Connection, Event as ConnEvent, RecvError};
 use crate::crypto::{Keys, MAX_BLOB};
 use crate::ctx::Ctx;
 use crate::fixed::FixedVec;
+use crate::handshake::EncryptedTicket;
 use crate::packet::Packet;
 use crate::stats::Counter;
 use crate::time::Timestamp;
-use crate::wire::{ConnectionId, HANDSHAKE_LEN, Header, PacketKind, encode_handshake, handshake_blob};
+use crate::wire::{HANDSHAKE_LEN, Header, PacketKind, encode_handshake, handshake_blob};
 
 /// Handshake steps are resent on this interval until answered.
 const RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -67,7 +68,7 @@ pub struct Connector {
     budget: BudgetConfig,
 
     started: Timestamp,
-    last_attempt: Timestamp,
+    last_attempt: Option<Timestamp>,
 
     connection: Option<Connection<ClientRole>>,
 }
@@ -85,7 +86,7 @@ impl Connector {
     pub fn connect(
         now: Timestamp,
         server: SocketAddr,
-        ticket: ResumeTicket,
+        ticket: EncryptedTicket,
         keys: Keys,
         channels: ChannelSet,
         budget: BudgetConfig,
@@ -99,7 +100,7 @@ impl Connector {
             channels,
             budget,
             started: now,
-            last_attempt: Timestamp::ZERO,
+            last_attempt: None,
             connection: None,
         }
     }
@@ -170,7 +171,7 @@ impl Connector {
         // echoed unchanged to prove this address receives.
         self.cookie = Some(cookie);
         self.state = State::Responding;
-        self.last_attempt = ctx.now;
+        self.last_attempt = Some(ctx.now);
 
         match self.write_handshake(out) {
             Some(len) => Action::Send(len),
@@ -186,8 +187,14 @@ impl Connector {
             return Action::Done;
         };
 
-        let conn_id = header.conn_id.unwrap_or(ConnectionId(0));
-        let mut conn = Connection::connect(ctx.now, conn_id, self.server, &self.keys, self.channels, self.budget);
+        let mut conn = Connection::connect(
+            ctx.now,
+            header.conn_id,
+            self.server,
+            &self.keys,
+            self.channels,
+            self.budget,
+        );
 
         // Verified by decrypting: a forged acceptance cannot authenticate, and
         // failing here leaves the cookie retrying, since the real acceptance may
@@ -236,10 +243,12 @@ impl Connector {
     pub fn poll_transmit(&mut self, ctx: &mut Ctx, out: &mut Packet) -> Option<usize> {
         match self.state {
             State::Requesting | State::Responding => {
-                if ctx.now.saturating_since(self.last_attempt) < RETRY_INTERVAL {
+                if let Some(last) = self.last_attempt
+                    && ctx.now.saturating_since(last) < RETRY_INTERVAL
+                {
                     return None;
                 }
-                self.last_attempt = ctx.now;
+                self.last_attempt = Some(ctx.now);
                 self.write_handshake(out)
             }
             State::Connected => self.connection.as_mut()?.poll_transmit(ctx, out),
@@ -280,7 +289,7 @@ impl Connector {
         match self.state {
             State::Requesting | State::Responding => Some(
                 self.last_attempt
-                    .saturating_add(RETRY_INTERVAL)
+                    .map_or(Timestamp::ZERO, |last| last.saturating_add(RETRY_INTERVAL))
                     .min(self.started.saturating_add(HANDSHAKE_TIMEOUT)),
             ),
             State::Connected => self.connection.as_ref()?.next_timeout(),
@@ -299,7 +308,7 @@ impl Connector {
 
     /// The most recent resume ticket the server sent. Stored with the keys, it is
     /// what `resume` needs after a drop.
-    pub fn take_resume_ticket(&mut self) -> Option<ResumeTicket> {
+    pub fn take_resume_ticket(&mut self) -> Option<EncryptedTicket> {
         self.connection.as_mut()?.take_resume_ticket()
     }
 }

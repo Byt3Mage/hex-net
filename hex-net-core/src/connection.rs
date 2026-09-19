@@ -13,8 +13,8 @@ use crate::budget::{Budget, BudgetConfig};
 use crate::channel::{ChannelSet, Channels, OnMessage, PacketMessages, SendError};
 use crate::crypto::{Key, Keys, MAX_BLOB};
 use crate::ctx::Ctx;
-use crate::fixed::{FixedVec, RingQueue};
-use crate::handshake::SessionId;
+use crate::fixed::RingQueue;
+use crate::handshake::{EncryptedTicket, SessionId};
 use crate::packet::{DecryptError, Packet, PacketCrypto};
 use crate::seq::{Sequence, WindowError};
 use crate::stats::Counter;
@@ -36,8 +36,6 @@ const CLOSE_SENDS: u8 = 3;
 
 /// How long an unproven path is probed before it is abandoned.
 const PATH_TIMEOUT: Duration = Duration::from_secs(3);
-
-pub type ResumeTicket = FixedVec<u8, MAX_BLOB>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -141,21 +139,18 @@ pub trait Role: Sized + sealed::Sealed {
     fn next_deadline(conn: &Connection<Self>) -> Option<Timestamp>;
 }
 
-/// Sends its connection id in every header. Identifies the server by address,
-/// so it never validates paths; it answers challenges rather than issuing them.
+/// Identifies the server by address, so it never validates paths. It answers
+/// challenges rather than issuing them.
 pub struct ClientRole;
 
 pub struct ClientState {
-    /// The most recent ticket the server sent.
-    ticket: Option<ResumeTicket>,
     /// Set when a ticket arrives, cleared when the application takes it.
     ticket_unread: bool,
     /// A challenge token awaiting its echo.
     pending_path_response: Option<u64>,
 }
 
-/// Omits the connection id from its headers. Validates any address change
-/// before trusting it, and issues resume tickets.
+/// Validates any address change before trusting it, and issues resume tickets.
 pub struct ServerRole;
 
 pub struct ServerState {
@@ -167,8 +162,6 @@ pub struct ServerState {
     pending_accept: bool,
     probe: Option<Probe>,
     pending_path_challenge: Option<u64>,
-    /// A ticket queued for delivery.
-    ticket: Option<ResumeTicket>,
 }
 
 #[derive(Clone, Copy)]
@@ -185,6 +178,10 @@ pub struct Connection<R: Role> {
     /// Where packets are sent. Changes only after path validation.
     addr: SocketAddr,
     lifecycle: Lifecycle,
+
+    /// - Server: A ticket queued for delivery.
+    /// - Client: The most recent ticket the server sent.
+    ticket: Option<EncryptedTicket>,
 
     crypto: PacketCrypto,
     delivery: Delivery<128>,
@@ -218,6 +215,7 @@ impl<R: Role> Connection<R> {
             id,
             addr,
             lifecycle: Lifecycle::Open,
+            ticket: None,
             // The connection id forms half of every nonce, so a resumed session
             // may reuse its keys under a newly assigned id.
             crypto: PacketCrypto::new(id, &tx, &rx),
@@ -398,8 +396,6 @@ impl<R: Role> Connection<R> {
         }
     }
 
-    // --------------------------------------------------------------- transmit
-
     /// Builds the next packet, if there is one. Returns its length in `buf`.
     ///
     /// One packet per call: coalescing everything for a peer into a single
@@ -413,9 +409,10 @@ impl<R: Role> Connection<R> {
         self.budget.assess(ctx.now, self.delivery.rtt());
         let allowance = self.budget.available(ctx.now) as usize;
 
-        let sequence = self.crypto.next_sequence();
+        let ticket = self.crypto.next_sequence();
+        let sequence = ticket.sequence();
         let header = self.build_header(ctx.now, sequence);
-        let body = self.crypto.begin(&header, buf)?;
+        let body = self.crypto.begin(&header, buf);
         let header_len = body.start;
 
         let mut w = BitWriter::new(&mut buf[body]);
@@ -446,11 +443,11 @@ impl<R: Role> Connection<R> {
         let _ = FrameKind::Padding.write(&mut w);
         let body_end = header_len + w.finish();
 
-        let Ok((sealed, len)) = self.crypto.encrypt(buf, header_len, body_end) else {
+        let Ok(len) = self.crypto.encrypt(ticket, buf, header_len, body_end) else {
             self.channels.on_packet_aborted(staged);
             return None;
         };
-        debug_assert_eq!(sealed, sequence);
+
         self.channels.on_packet_sent(sequence, staged);
 
         self.delivery.on_sent(ctx.now, sequence, len, eliciting);
@@ -485,11 +482,7 @@ impl<R: Role> Connection<R> {
 
         Header {
             kind: PacketKind::Payload,
-            // Always present, in both directions. The nonce is conn_id ||
-            // sequence, so a peer that does not have the id cannot decrypt
-            // anything; sending it unconditionally removes any state on which
-            // that could depend.
-            conn_id: Some(self.id),
+            conn_id: self.id,
             sequence: sequence.to_wire(),
             ack,
             ack_delay,
@@ -609,11 +602,11 @@ impl Role for ClientRole {
                 let len = r.read_range(0, MAX_BLOB as u32)? as usize;
                 r.align()?;
                 let bytes = r.peek_bytes(len).ok_or(ReadError::Eof)?;
-                let received = ResumeTicket::from_slice(bytes).ok_or(ReadError::OutOfRange)?;
+                let received = EncryptedTicket::from_slice(bytes).ok_or(ReadError::OutOfRange)?;
                 r.skip_bytes(len)?;
 
                 // Only the newest ticket is useful.
-                conn.role.ticket = Some(received);
+                conn.ticket = Some(received);
                 conn.role.ticket_unread = true;
                 conn.events.push(Event::ResumeTicketReceived);
                 Ok(())
@@ -669,11 +662,7 @@ impl Connection<ClientRole> {
             keys,
             channels,
             budget,
-            ClientState {
-                ticket: None,
-                ticket_unread: false,
-                pending_path_response: None,
-            },
+            ClientState { ticket_unread: false, pending_path_response: None },
         )
     }
 
@@ -682,12 +671,12 @@ impl Connection<ClientRole> {
     ///
     /// Returns a copy and keeps it, so a caller that fails to persist it can ask
     /// again after the next arrival.
-    pub fn take_resume_ticket(&mut self) -> Option<ResumeTicket> {
+    pub fn take_resume_ticket(&mut self) -> Option<EncryptedTicket> {
         if !self.role.ticket_unread {
             return None;
         }
         self.role.ticket_unread = false;
-        self.role.ticket
+        self.ticket
     }
 }
 
@@ -741,7 +730,7 @@ impl Role for ServerRole {
             wrote = true;
         }
 
-        if let Some(queued) = conn.role.ticket {
+        if let Some(queued) = conn.ticket {
             let at = w.checkpoint();
             let ok = FrameKind::Control.write(w).is_ok()
                 && ControlKind::ResumeTicket.write(w).is_ok()
@@ -749,10 +738,10 @@ impl Role for ServerRole {
                 && w.align().is_ok()
                 && w.write_bytes(&queued).is_ok();
             if ok {
-                conn.role.ticket = None;
+                conn.ticket = None;
                 wrote = true;
             } else {
-                // Did not fit; it stays queued for the next packet.
+                // Did not fit, so it stays queued for the next packet.
                 w.rollback(at);
             }
         }
@@ -812,7 +801,6 @@ impl Connection<ServerRole> {
                 pending_accept: true,
                 probe: None,
                 pending_path_challenge: None,
-                ticket: None,
             },
         )
     }
@@ -845,8 +833,8 @@ impl Connection<ServerRole> {
 
     /// Queues a resume ticket for delivery. Call periodically so the client
     /// always holds a fresh one.
-    pub fn send_resume_ticket(&mut self, ticket: ResumeTicket) {
-        self.role.ticket = Some(ticket);
+    pub fn send_resume_ticket(&mut self, ticket: EncryptedTicket) {
+        self.ticket = Some(ticket);
     }
 }
 

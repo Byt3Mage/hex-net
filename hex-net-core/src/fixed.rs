@@ -116,12 +116,6 @@ impl<T: Copy, const CAP: usize> FixedVec<T, CAP> {
     pub fn clear(&mut self) {
         self.len = 0;
     }
-
-    #[inline]
-    pub fn set_len(&mut self, len: usize) {
-        assert!(len <= CAP, "length exceeds capacity");
-        self.len = len as u32;
-    }
 }
 
 impl<T: Copy, const N: usize> Deref for FixedVec<T, N> {
@@ -158,10 +152,8 @@ impl<T: Copy + Default, const N: usize> Default for RingQueue<T, N> {
 }
 
 impl<T: Copy + Default, const N: usize> RingQueue<T, N> {
-    const CHECK: () = assert!(N.is_power_of_two() && (N > 0));
-
     pub fn new() -> Self {
-        let () = Self::CHECK;
+        const { assert!(N.is_power_of_two() && (N > 0)) };
         Self {
             items: [T::default(); N],
             head: 0,

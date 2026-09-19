@@ -6,6 +6,20 @@ use crate::crypto::{Cipher, CryptoError, Key, TAG_LEN};
 use crate::seq::{self, ReceiveWindow, Sequence, WindowError, WireSequence};
 use crate::wire::{ConnectionId, Header, MAX_DATAGRAM, PacketKind};
 
+/// A claim on the next outgoing sequence.
+///
+/// `encrypt` consumes it, so the sequence written into the header and the one
+/// used for the nonce are necessarily the same. Dropping it unused leaves the
+/// counter untouched, which is what an abandoned packet needs.
+pub struct SequenceTicket(Sequence);
+
+impl SequenceTicket {
+    #[inline]
+    pub fn sequence(&self) -> Sequence {
+        self.0
+    }
+}
+
 /// A datagram-sized buffer.
 ///
 /// Sizing it in the type removes the length check every entry point would
@@ -64,8 +78,8 @@ impl PacketCrypto {
     }
 
     #[inline]
-    pub fn next_sequence(&self) -> Sequence {
-        self.next_sequence
+    pub fn next_sequence(&self) -> SequenceTicket {
+        SequenceTicket(self.next_sequence)
     }
 
     /// The newest sequence worth acknowledging, for the outgoing header.
@@ -115,24 +129,23 @@ impl PacketCrypto {
     }
 
     /// Writes `header` and returns the writable body range, which excludes the
-    /// space `seal` needs for the tag.
-    pub fn begin(&self, header: &Header, buf: &mut [u8; MAX_DATAGRAM]) -> Option<Range<usize>> {
-        let header_len = header.encode(buf).ok()?;
-        Some((header_len..(MAX_DATAGRAM - TAG_LEN)).into())
+    /// space `encrypt` needs for the tag.
+    pub fn begin(&self, header: &Header, buf: &mut Packet) -> core::ops::Range<usize> {
+        header.encode(buf)..(MAX_DATAGRAM - TAG_LEN)
     }
 
-    /// Encrypts the body in place and appends the tag, consuming the sequence
-    /// number. Returns the sequence the packet carried and the datagram length.
+    /// Encrypts the body in place and appends the tag, consuming `ticket` and
+    /// with it the sequence number. Returns the datagram length.
     pub fn encrypt(
         &mut self,
+        ticket: SequenceTicket,
         buf: &mut Packet,
         header_len: usize,
         body_end: usize,
-    ) -> Result<(Sequence, usize), CryptoError> {
-        let sequence = self.next_sequence;
-        let len = self.tx.encrypt(sequence.get(), buf, header_len, body_end)?;
-        self.next_sequence = sequence.next();
-        Ok((sequence, len))
+    ) -> Result<usize, CryptoError> {
+        let len = self.tx.encrypt(ticket.0.get(), buf, header_len, body_end)?;
+        self.next_sequence = ticket.0.next();
+        Ok(len)
     }
 
     /// Resolves a peer's acknowledgement, rejecting anything ahead of our own

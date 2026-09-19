@@ -62,12 +62,11 @@ pub struct ConnectionId(pub u32);
 
 mod flags {
     pub const KIND_MASK: u8 = 0b0000_0011;
-    pub const CONN_ID: u8 = 0b0000_0100;
-    pub const ACK: u8 = 0b0000_1000;
-    pub const ACK_BITS: u8 = 0b0001_0000;
+    pub const ACK: u8 = 0b0000_0100;
+    pub const ACK_BITS: u8 = 0b000_1000;
     /// Must be zero, so future versions can define them and older builds reject
     /// rather than misread packets that use them.
-    pub const RESERVED: u8 = 0b1110_0000;
+    pub const RESERVED: u8 = 0b1111_0000;
 }
 
 /// Cleartext header of a payload packet, authenticated as AEAD associated data.
@@ -76,7 +75,7 @@ pub struct Header {
     pub kind: PacketKind,
     /// Present on client-to-server packets only: the server routes by id, while
     /// the client identifies the server by address.
-    pub conn_id: Option<ConnectionId>,
+    pub conn_id: ConnectionId,
     pub sequence: WireSequence,
     /// Newest sequence received from the peer.
     pub ack: Option<WireSequence>,
@@ -90,61 +89,46 @@ pub struct Header {
 impl Header {
     pub const MAX_LEN: usize = 14;
 
-    #[allow(clippy::len_without_is_empty)]
-    pub fn len(&self) -> usize {
-        let mut len = 1 + 2;
-        if self.conn_id.is_some() {
-            len += 4;
-        }
-        if self.ack.is_some() {
-            len += 3;
-            if self.ack_bits != 0 {
-                len += 4;
-            }
-        }
-        len
-    }
-
     /// Writes the header. The bytes written become the AEAD associated data.
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, WriteError> {
-        let len = self.len();
-        if out.len() < len {
-            return Err(WriteError::Overflow);
-        }
+    pub fn encode(&self, out: &mut [u8; MAX_DATAGRAM]) -> usize {
+        const { assert!(Self::MAX_LEN < MAX_DATAGRAM) };
 
+        // encode packet kind
         let mut flags = self.kind as u8;
-        if self.conn_id.is_some() {
-            flags |= flags::CONN_ID;
-        }
-        if self.ack.is_some() {
-            flags |= flags::ACK;
-            if self.ack_bits != 0 {
-                flags |= flags::ACK_BITS;
-            }
-        }
-        out[0] = flags;
 
-        let mut at = 1;
-        if let Some(ConnectionId(id)) = self.conn_id {
-            out[at..(at + 4)].copy_from_slice(&id.to_le_bytes());
-            at += 4;
-        }
-        out[at..(at + 2)].copy_from_slice(&self.sequence.0.to_le_bytes());
+        // encode connection id
+        out[1..5].copy_from_slice(&self.conn_id.0.to_le_bytes());
+        let mut at = 5;
+
+        // encode wire sequence
+        out[at..at + 2].copy_from_slice(&self.sequence.0.to_le_bytes());
         at += 2;
 
         if let Some(ack) = self.ack {
-            out[at..(at + 2)].copy_from_slice(&ack.0.to_le_bytes());
+            flags |= flags::ACK;
+
+            // encode ack
+            out[at..at + 2].copy_from_slice(&ack.0.to_le_bytes());
             at += 2;
+
+            // encode ack delay
             out[at] = self.ack_delay;
             at += 1;
+
+            // encode ackbits
             if self.ack_bits != 0 {
-                out[at..(at + 4)].copy_from_slice(&self.ack_bits.to_le_bytes());
+                flags |= flags::ACK_BITS;
+
+                out[at..at + 4].copy_from_slice(&self.ack_bits.to_le_bytes());
                 at += 4;
             }
         }
 
-        debug_assert_eq!(at, len);
-        Ok(at)
+        // write flags now.
+        out[0] = flags;
+
+        // total length used
+        at
     }
 
     /// Parses a header from untrusted bytes. Every failure is an error.
@@ -153,16 +137,11 @@ impl Header {
         if (first & flags::RESERVED) != 0 {
             return Err(ReadError::OutOfRange);
         }
-        let kind = PacketKind::from_bits(first & flags::KIND_MASK).ok_or(ReadError::OutOfRange)?;
 
-        let mut at = 1;
-        let conn_id = if (first & flags::CONN_ID) != 0 {
-            let id = u32::from_le_bytes(read_array(input, at)?);
-            at += 4;
-            Some(ConnectionId(id))
-        } else {
-            None
-        };
+        let kind = PacketKind::from_bits(first & flags::KIND_MASK).ok_or(ReadError::OutOfRange)?;
+        let conn_id = ConnectionId(u32::from_le_bytes(read_array(input, 1)?));
+
+        let mut at = 5;
 
         let sequence = WireSequence(u16::from_le_bytes(read_array(input, at)?));
         at += 2;
@@ -173,8 +152,10 @@ impl Header {
         if (first & flags::ACK) != 0 {
             ack = Some(WireSequence(u16::from_le_bytes(read_array(input, at)?)));
             at += 2;
+
             ack_delay = *input.get(at).ok_or(ReadError::Eof)?;
             at += 1;
+
             if (first & flags::ACK_BITS) != 0 {
                 ack_bits = u32::from_le_bytes(read_array(input, at)?);
                 at += 4;

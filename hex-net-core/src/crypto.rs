@@ -16,18 +16,6 @@ pub const MAX_BLOB: usize = 512;
 
 pub type Key = [u8; 32];
 
-pub struct Blob<const N: usize> {
-    pub data: [u8; N],
-    pub len: usize,
-}
-
-impl<const N: usize> Blob<N> {
-    pub fn as_slice(&self) -> &[u8] {
-        debug_assert!(self.len <= N);
-        &self.data[..self.len]
-    }
-}
-
 /// Both directions' keys for one session.
 ///
 /// Fixed for the session's life, including across resumes. The connection id

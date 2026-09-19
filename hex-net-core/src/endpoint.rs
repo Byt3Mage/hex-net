@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use crate::budget::BudgetConfig;
 use crate::channel::{ChannelSet, OnMessage};
-use crate::connection::{CloseReason, Connection, Event as ConnEvent, RecvError, ResumeTicket, ServerRole};
+use crate::connection::{CloseReason, Connection, Event as ConnEvent, RecvError, ServerRole};
 use crate::crypto::{Key, MAX_BLOB};
 use crate::ctx::Ctx;
 use crate::fixed::{FixedVec, RingQueue};
-use crate::handshake::{Acceptor, COOKIE_LIFETIME, HandshakeError, RESUME_GRACE, SessionId, Ticket};
+use crate::handshake::{Acceptor, COOKIE_LIFETIME, EncryptedTicket, HandshakeError, RESUME_GRACE, SessionId, Ticket};
 use crate::packet::Packet;
 use crate::slab::{Handle, Slab};
 use crate::stats::Counter;
@@ -242,7 +242,7 @@ impl Endpoint {
         let mut encrypted = [0u8; MAX_BLOB];
         let len = self.acceptor.encrypt_resume_ticket(now, ticket, &mut encrypted)?;
         let conn = self.connections.get_mut(handle).ok_or(HandshakeError::NoSession)?;
-        let stored = ResumeTicket::from_slice(&encrypted[..len]).ok_or(HandshakeError::Malformed)?;
+        let stored = EncryptedTicket::from_slice(&encrypted[..len]).ok_or(HandshakeError::Malformed)?;
         conn.send_resume_ticket(stored);
         Ok(())
     }
@@ -293,17 +293,12 @@ impl Endpoint {
             ctx.counters.inc(Counter::PacketsMalformed);
             return Action::Dropped(DropReason::Malformed);
         };
-        let Some(conn_id) = header.conn_id else {
-            ctx.counters.inc(Counter::PacketsMalformed);
-            return Action::Dropped(DropReason::Malformed);
-        };
-        let Some(&handle) = self.routes.get(&conn_id) else {
+        let Some(&handle) = self.routes.get(&header.conn_id) else {
             ctx.counters.inc(Counter::PacketsUnknownConnection);
             return Action::Dropped(DropReason::UnknownConnection);
         };
         let Some(conn) = self.connections.get_mut(handle) else {
-            // The route outlived its connection.
-            self.routes.remove(&conn_id);
+            self.routes.remove(&header.conn_id); // The route outlived its connection.
             ctx.counters.inc(Counter::PacketsUnknownConnection);
             return Action::Dropped(DropReason::UnknownConnection);
         };
@@ -363,22 +358,26 @@ impl Endpoint {
             return Action::Dropped(DropReason::Handshake(HandshakeError::Expired));
         }
 
-        // Rechecked here as well as at the request: up to COOKIE_LIFETIME has
-        // passed, during which a grace period may have lapsed or another
-        // response may already have claimed the session.
-        if let Err(error) = self.check_ticket(ctx.now, &cookie.ticket) {
-            return Action::Dropped(DropReason::Handshake(error));
-        }
-
         // A client whose acceptance was lost retries with the same cookie. The
         // ticket is the identity: re-send the acceptance on the connection it
         // already produced rather than creating a second one.
+        //
+        // Checked before the ticket, because accepting a resume turns its
+        // session from suspended to live, which is exactly what `check_ticket`
+        // rejects. A retry would otherwise be refused rather than recognised.
         if let Some(&handle) = self.accepted.get(&cookie.ticket.token_id) {
             if let Some(conn) = self.connections.get_mut(handle) {
                 conn.resend_acceptance();
                 return Action::Connected(handle);
             }
             self.accepted.remove(&cookie.ticket.token_id);
+        }
+
+        // Rechecked here as well as at the request: up to COOKIE_LIFETIME has
+        // passed, during which a grace period may have lapsed or another
+        // response may already have claimed the session.
+        if let Err(error) = self.check_ticket(ctx.now, &cookie.ticket) {
+            return Action::Dropped(DropReason::Handshake(error));
         }
 
         let resumed = cookie.ticket.session.is_some();
@@ -424,9 +423,9 @@ impl Endpoint {
         if now > ticket.expires_at {
             return Err(HandshakeError::Expired);
         }
-        let Some(session) = ticket.session else {
-            return Ok(());
-        };
+
+        let Some(session) = ticket.session else { return Ok(()) };
+
         match self.sessions.get(&session) {
             Some(SessionState::Suspended { since }) if now.saturating_since(*since) <= RESUME_GRACE => Ok(()),
             _ => Err(HandshakeError::NoSession),

@@ -129,12 +129,12 @@ impl<const N: usize> Arena<N> {
     /// Pieces may be written in any order, which is what fragment reassembly
     /// needs.
     pub fn write_at(&mut self, message: MessageRef, offset: usize, bytes: &[u8]) -> bool {
-        if bytes.is_empty() {
-            return true;
+        if message.is_none() || (offset + bytes.len()) > message.len() {
+            return false;
         }
 
-        if message.is_none() || ((offset + bytes.len()) > message.len()) {
-            return false;
+        if bytes.is_empty() {
+            return true;
         }
 
         // Walk to the block holding `offset`.
