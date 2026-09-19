@@ -104,7 +104,7 @@ impl Acceptor {
         Self { backend_key, server_key: crypto::generate_key() }
     }
 
-    /// Opens a ticket from a connection request, sealed by either the backend or
+    /// Decrypts a ticket from a connection request, encrypted by either the backend or
     /// by this server. Which it was is visible in `Ticket::session`.
     pub fn decrypt_ticket(&self, packet: &[u8]) -> Result<Ticket, HandshakeError> {
         if packet.len() < HANDSHAKE_LEN {

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::budget::BudgetConfig;
 use crate::channel::{ChannelSet, OnMessage};
-use crate::connection::{CloseReason, Connection, Event as ConnEvent, RecvError, ServerRole};
+use crate::connection::{CloseReason, Connection, Event as ConnEvent, RecvError, Server};
 use crate::crypto::{Key, MAX_BLOB};
 use crate::ctx::Ctx;
 use crate::fixed::{FixedVec, RingQueue};
@@ -54,7 +54,7 @@ impl EndpointConfig {
 }
 
 /// Every connection an endpoint owns is a server-side one.
-pub type ServerConnection = Connection<ServerRole>;
+pub type ServerConnection = Connection<Server>;
 
 /// What the caller should do with a datagram.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,8 +246,6 @@ impl Endpoint {
         conn.send_resume_ticket(stored);
         Ok(())
     }
-
-    // ---------------------------------------------------------------- receive
 
     /// Processes one datagram. `buf[..len]` may be decrypted in place, a
     /// challenge is written to `out` when the result is `Respond`, and

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::budget::BudgetConfig;
 use crate::channel::{ChannelSet, OnMessage};
-use crate::connection::{ClientRole, CloseReason, Connection, Event as ConnEvent, RecvError};
+use crate::connection::{Client, CloseReason, Connection, Event as ConnEvent, RecvError};
 use crate::crypto::{Keys, MAX_BLOB};
 use crate::ctx::Ctx;
 use crate::fixed::FixedVec;
@@ -70,7 +70,7 @@ pub struct Connector {
     started: Timestamp,
     last_attempt: Option<Timestamp>,
 
-    connection: Option<Connection<ClientRole>>,
+    connection: Option<Connection<Client>>,
 }
 
 impl Connector {
@@ -111,12 +111,12 @@ impl Connector {
     }
 
     #[inline]
-    pub fn connection(&self) -> Option<&Connection<ClientRole>> {
+    pub fn connection(&self) -> Option<&Connection<Client>> {
         self.connection.as_ref()
     }
 
     #[inline]
-    pub fn connection_mut(&mut self) -> Option<&mut Connection<ClientRole>> {
+    pub fn connection_mut(&mut self) -> Option<&mut Connection<Client>> {
         self.connection.as_mut()
     }
 

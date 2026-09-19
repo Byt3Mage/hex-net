@@ -103,18 +103,12 @@ enum Lifecycle {
 
 mod sealed {
     pub trait Sealed {}
-    impl Sealed for super::ClientRole {}
-    impl Sealed for super::ServerRole {}
+    impl Sealed for super::Client {}
+    impl Sealed for super::Server {}
 }
 
 /// Which side of a connection this is.
-///
-/// Sealed: the two sides of the protocol are fixed, and an outside
-/// implementation could not satisfy the wire contract.
 pub trait Role: Sized + sealed::Sealed {
-    /// State only this side holds.
-    type State;
-
     /// Splits a session's keys into this side's transmit and receive pair.
     fn split_keys(keys: &Keys) -> (Key, Key);
 
@@ -141,9 +135,7 @@ pub trait Role: Sized + sealed::Sealed {
 
 /// Identifies the server by address, so it never validates paths. It answers
 /// challenges rather than issuing them.
-pub struct ClientRole;
-
-pub struct ClientState {
+pub struct Client {
     /// Set when a ticket arrives, cleared when the application takes it.
     ticket_unread: bool,
     /// A challenge token awaiting its echo.
@@ -151,9 +143,7 @@ pub struct ClientState {
 }
 
 /// Validates any address change before trusting it, and issues resume tickets.
-pub struct ServerRole;
-
-pub struct ServerState {
+pub struct Server {
     session: SessionId,
     /// The ticket this connection was accepted from, so a retried handshake can
     /// be recognised and the connection released from the accepted table.
@@ -196,7 +186,7 @@ pub struct Connection<R: Role> {
     pending_ping: bool,
 
     events: RingQueue<Event, 16>,
-    role: R::State,
+    role: R,
 }
 
 impl<R: Role> Connection<R> {
@@ -207,7 +197,7 @@ impl<R: Role> Connection<R> {
         keys: &Keys,
         channels: ChannelSet,
         budget: BudgetConfig,
-        role: R::State,
+        role: R,
     ) -> Self {
         let (tx, rx) = R::split_keys(keys);
 
@@ -584,9 +574,7 @@ impl<R: Role> Connection<R> {
 
 // ----------------------------------------------------------------- client
 
-impl Role for ClientRole {
-    type State = ClientState;
-
+impl Role for Client {
     fn split_keys(keys: &Keys) -> (Key, Key) {
         (keys.client_to_server, keys.server_to_client)
     }
@@ -645,7 +633,7 @@ impl Role for ClientRole {
     }
 }
 
-impl Connection<ClientRole> {
+impl Connection<Client> {
     /// Created once the server's first packet reveals the assigned connection id.
     pub fn connect(
         now: Timestamp,
@@ -662,7 +650,7 @@ impl Connection<ClientRole> {
             keys,
             channels,
             budget,
-            ClientState { ticket_unread: false, pending_path_response: None },
+            Client { ticket_unread: false, pending_path_response: None },
         )
     }
 
@@ -682,9 +670,7 @@ impl Connection<ClientRole> {
 
 // ----------------------------------------------------------------- server
 
-impl Role for ServerRole {
-    type State = ServerState;
-
+impl Role for Server {
     fn split_keys(keys: &Keys) -> (Key, Key) {
         (keys.server_to_client, keys.client_to_server)
     }
@@ -777,7 +763,8 @@ impl Role for ServerRole {
     }
 }
 
-impl Connection<ServerRole> {
+impl Connection<Server> {
+    #[allow(clippy::too_many_arguments)]
     pub fn accept(
         now: Timestamp,
         id: ConnectionId,
@@ -795,7 +782,7 @@ impl Connection<ServerRole> {
             keys,
             channels,
             budget,
-            ServerState {
+            Server {
                 session,
                 token_id,
                 pending_accept: true,
