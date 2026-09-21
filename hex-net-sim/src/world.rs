@@ -11,12 +11,15 @@ use std::{
     time::Duration,
 };
 
-use hex_net_core::channel::ChannelSet;
-use hex_net_core::connector::Connector;
-use hex_net_core::crypto::Key;
-use hex_net_core::endpoint::{Endpoint, EndpointConfig};
-use hex_net_core::time::Timestamp;
-use hex_net_core::{budget::BudgetConfig, handshake::SessionId};
+use hex_net_core::{
+    budget::BudgetConfig,
+    channel::ChannelSet,
+    connector::Connector,
+    crypto::{Key, Keys},
+    endpoint::{Endpoint, EndpointConfig},
+    handshake::{EncryptedTicket, SessionId},
+    time::Timestamp,
+};
 use hex_net_io::driver::{ClientApp, ClientDriver, ServerApp, ServerDriver};
 
 use crate::{
@@ -90,9 +93,8 @@ pub struct World<S: ServerApp, C: ClientApp> {
     /// longer matches `armed` is stale.
     wakes: BinaryHeap<Wake>,
     armed: HashMap<Node, Timestamp>,
-    /// Handed out one per ticket, since a ticket is spent by the handshake it
-    /// completes.
-    next_token: u64,
+    /// Each client's most recent ticket, for replaying.
+    tickets: HashMap<usize, EncryptedTicket>,
     /// Nodes to step at the current instant regardless of deadlines: new, or
     /// changed from outside.
     pending: BTreeSet<Node>,
@@ -121,7 +123,7 @@ impl<S: ServerApp, C: ClientApp> World<S, C> {
             addresses,
             wakes: BinaryHeap::new(),
             armed: HashMap::new(),
-            next_token: 1,
+            tickets: HashMap::new(),
             pending: BTreeSet::from([Node::Server]),
         }
     }
@@ -152,25 +154,62 @@ impl<S: ServerApp, C: ClientApp> World<S, C> {
         index
     }
 
-    /// A connector for a client, resuming `session` when given one.
-    ///
-    /// Every ticket for a client carries the same session keys, deliberately:
-    /// the transport binds each connection's keys to its own handshake, so a
-    /// reconnect must work even when a backend reuses them.
+    /// A connector for a client with a freshly sealed ticket, resuming
+    /// `session` when given one.
     fn new_connector(&mut self, index: usize, session: Option<SessionId>) -> Connector {
-        let token = self.next_token;
-        self.next_token += 1;
-        let keys = session_keys(self.seed ^ ((index as u64) + 1));
-        let ticket = issue_ticket(&BACKEND_KEY, self.now, token, (index as u64) + 1, session, &keys);
+        let ticket = issue_ticket(&BACKEND_KEY, self.now, (index as u64) + 1, session, &self.keys(index));
+        self.connector_with(index, ticket)
+    }
 
+    fn keys(&self, index: usize) -> Keys {
+        session_keys(self.seed ^ ((index as u64) + 1))
+    }
+
+    fn connector_with(&mut self, index: usize, ticket: EncryptedTicket) -> Connector {
+        self.tickets.insert(index, ticket);
         Connector::connect(
             self.now,
             self.server_addr,
             ticket,
-            keys,
+            self.keys(index),
             self.channels,
             BudgetConfig::DEFAULT,
         )
+    }
+
+    /// The sealed ticket a client last presented, as anyone watching its
+    /// network could copy it from the request.
+    pub fn ticket(&self, index: usize) -> EncryptedTicket {
+        self.tickets[&index]
+    }
+
+    /// Adds a client at a new address presenting `ticket`, which need not be
+    /// its own: an attacker replaying a captured request. Returns its index.
+    pub fn add_client_with_ticket(&mut self, up: Link, down: Link, ticket: EncryptedTicket, app: C) -> usize {
+        let index = self.clients.len();
+        let [a, b] = u16::try_from(index + 1).expect("at most 65,535 clients").to_be_bytes();
+        let addr = Rc::new(Cell::new(SocketAddr::from((Ipv4Addr::new(10, 1, a, b), 40_000))));
+        self.wire.borrow_mut().add_path(addr.get(), up, down);
+
+        let socket = SimSocket::new(Rc::clone(&self.wire), Rc::clone(&addr));
+        let connector = self.connector_with(index, ticket);
+        self.clients.push(Client {
+            driver: ClientDriver::new(socket, connector),
+            app,
+            addr: Rc::clone(&addr),
+            crashed: false,
+        });
+        self.addresses.insert(addr.get(), Node::Client(index));
+        self.pending.insert(Node::Client(index));
+        index
+    }
+
+    /// Starts a client over presenting the exact ticket it last connected
+    /// with, as someone who captured that request and replays it would.
+    pub fn replay_ticket(&mut self, index: usize, app: C) {
+        let ticket = self.tickets[&index];
+        let connector = self.connector_with(index, ticket);
+        self.replace_driver(index, connector, app);
     }
 
     /// Stops a client dead. Like a crashed process, it stops reading or sending,
@@ -206,8 +245,11 @@ impl<S: ServerApp, C: ClientApp> World<S, C> {
     /// relaunching the game does. Its recorded state starts over with `app`.
     pub fn reconnect_client(&mut self, index: usize, session: SessionId, app: C) {
         let connector = self.new_connector(index, Some(session));
-        let socket = SimSocket::new(Rc::clone(&self.wire), Rc::clone(&self.clients[index].addr));
+        self.replace_driver(index, connector, app);
+    }
 
+    fn replace_driver(&mut self, index: usize, connector: Connector, app: C) {
+        let socket = SimSocket::new(Rc::clone(&self.wire), Rc::clone(&self.clients[index].addr));
         let client = &mut self.clients[index];
         client.driver = ClientDriver::new(socket, connector);
         client.app = app;

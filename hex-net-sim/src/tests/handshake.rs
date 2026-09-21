@@ -5,7 +5,9 @@ use hex_net_core::{
     connector::State as ClientState,
     crypto::{Key, MAX_BLOB, NONCE_LEN},
     endpoint::Event as ServerEvent,
-    handshake::{Acceptor, HandshakeError, MAX_USER_DATA, RESUME_GRACE, SessionId, Ticket, UserData, encrypt_ticket},
+    handshake::{
+        Acceptor, HandshakeError, MAX_USER_DATA, RESUME_GRACE, SessionId, Ticket, TicketId, UserData, encrypt_ticket,
+    },
     packet::Packet,
     time::Timestamp,
     wire::{ClientNonce, HANDSHAKE_LEN, MAX_DATAGRAM, PacketKind, encode_handshake},
@@ -27,7 +29,6 @@ fn a_ticket_round_trips_through_a_request() {
 
     let original = Ticket {
         expires_at: now.saturating_add(Duration::from_secs(60)),
-        token_id: 0xFEED_FACE_CAFE_BEEF,
         client_id: 0x0123_4567_89AB_CDEF,
         session: None,
         keys,
@@ -42,7 +43,6 @@ fn a_ticket_round_trips_through_a_request() {
 
     let decoded = acceptor.decrypt_ticket(&packet[..HANDSHAKE_LEN]).expect("decrypt");
 
-    assert_eq!(decoded.token_id, original.token_id);
     assert_eq!(decoded.client_id, original.client_id);
     assert_eq!(decoded.expires_at, original.expires_at);
     assert_eq!(decoded.session, None);
@@ -60,7 +60,6 @@ fn a_resume_ticket_names_its_session() {
 
     let ticket = Ticket {
         expires_at: now,
-        token_id: 7,
         client_id: 7,
         session: Some(SessionId(42)),
         keys: session_keys(7),
@@ -88,7 +87,6 @@ fn a_foreign_key_does_not_open_a_ticket() {
 
     let ticket = Ticket {
         expires_at: now.saturating_add(Duration::from_secs(60)),
-        token_id: 1,
         client_id: 1,
         session: None,
         keys: session_keys(1),
@@ -116,7 +114,6 @@ fn a_tampered_ticket_fails_authentication() {
 
     let ticket = Ticket {
         expires_at: now.saturating_add(Duration::from_secs(60)),
-        token_id: 1,
         client_id: 1,
         session: None,
         keys: session_keys(1),
@@ -152,7 +149,6 @@ fn a_cookie_binds_the_address_that_presented_the_ticket() {
 
     let ticket = Ticket {
         expires_at: now.saturating_add(Duration::from_secs(60)),
-        token_id: 99,
         client_id: 99,
         session: Some(SessionId(3)),
         keys: session_keys(99),
@@ -166,7 +162,14 @@ fn a_cookie_binds_the_address_that_presented_the_ticket() {
 
         let mut encrypted = [0u8; MAX_BLOB];
         let len = acceptor
-            .encrypt_cookie(now, addr, ClientNonce(0x5EED), &ticket, &mut encrypted)
+            .encrypt_cookie(
+                now,
+                addr,
+                ClientNonce(0x5EED),
+                TicketId([0x1D; TicketId::LEN]),
+                &ticket,
+                &mut encrypted,
+            )
             .expect("encrypt");
 
         let mut packet: Packet = [0u8; MAX_DATAGRAM];
@@ -177,7 +180,7 @@ fn a_cookie_binds_the_address_that_presented_the_ticket() {
         assert_eq!(cookie.addr, addr, "{text}");
         assert_eq!(cookie.nonce, ClientNonce(0x5EED), "{text}");
         assert_eq!(cookie.issued_at, now);
-        assert_eq!(cookie.ticket.token_id, ticket.token_id);
+        assert_eq!(cookie.ticket_id, TicketId([0x1D; TicketId::LEN]), "{text}");
         assert_eq!(cookie.ticket.session, ticket.session);
         assert_eq!(
             cookie.ticket.keys.client_to_server, ticket.keys.client_to_server,
@@ -199,7 +202,6 @@ fn a_cookie_carries_a_full_user_data_payload() {
 
     let ticket = Ticket {
         expires_at: now.saturating_add(Duration::from_secs(60)),
-        token_id: u64::MAX,
         client_id: u64::MAX,
         session: Some(SessionId(u64::MAX)),
         keys: session_keys(5),
@@ -209,7 +211,14 @@ fn a_cookie_carries_a_full_user_data_payload() {
     let addr = "[2001:db8::1]:65535".parse().expect("literal address");
     let mut encrypted = [0u8; MAX_BLOB];
     let len = acceptor
-        .encrypt_cookie(now, addr, ClientNonce(0x5EED), &ticket, &mut encrypted)
+        .encrypt_cookie(
+            now,
+            addr,
+            ClientNonce(0x5EED),
+            TicketId([0x1D; TicketId::LEN]),
+            &ticket,
+            &mut encrypted,
+        )
         .expect("a full ticket fits a cookie");
 
     let mut packet: Packet = [0u8; MAX_DATAGRAM];
@@ -230,7 +239,6 @@ fn a_cookie_from_another_server_is_rejected() {
 
     let ticket = Ticket {
         expires_at: now.saturating_add(Duration::from_secs(60)),
-        token_id: 1,
         client_id: 1,
         session: None,
         keys: session_keys(1),
@@ -240,7 +248,14 @@ fn a_cookie_from_another_server_is_rejected() {
     let addr = "10.0.0.2:40000".parse().expect("literal address");
     let mut encrypted = [0u8; MAX_BLOB];
     let len = issuer
-        .encrypt_cookie(now, addr, ClientNonce(0x5EED), &ticket, &mut encrypted)
+        .encrypt_cookie(
+            now,
+            addr,
+            ClientNonce(0x5EED),
+            TicketId([0x1D; TicketId::LEN]),
+            &ticket,
+            &mut encrypted,
+        )
         .expect("encrypt");
 
     let mut packet: Packet = [0u8; MAX_DATAGRAM];

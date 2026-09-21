@@ -1,6 +1,6 @@
 //! The server's front door: routing, handshakes, and session lifetime.
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::hash::{BuildHasher, RandomState};
 use std::marker::PhantomData;
@@ -14,7 +14,9 @@ use crate::{
     crypto::{Key, MAX_BLOB},
     ctx::Ctx,
     fixed::RingQueue,
-    handshake::{Acceptor, COOKIE_LIFETIME, EncryptedTicket, HandshakeError, RESUME_GRACE, SessionId, Ticket},
+    handshake::{
+        Acceptor, COOKIE_LIFETIME, EncryptedTicket, HandshakeError, RESUME_GRACE, SessionId, Ticket, TicketId,
+    },
     packet::Packet,
     slab::{Handle, Slab},
     stats::Counter,
@@ -155,6 +157,18 @@ enum SessionState {
     Suspended { since: Timestamp },
 }
 
+/// A ticket that has produced a connection.
+///
+/// Kept until the ticket expires, so it can never produce another: after
+/// expiry `check_ticket` refuses it anyway, and nothing is lost by forgetting.
+/// The expiry itself lives in `redeemed_expiry`, which orders the forgetting.
+#[derive(Clone, Copy)]
+struct Redeemed {
+    /// The connection it produced, while that connection lives. A retried
+    /// response for the same ticket is answered from it.
+    connection: Option<Handle<ServerConnection>>,
+}
+
 /// A session in the world, kept across the connections that carry it.
 #[derive(Clone, Copy)]
 struct Session {
@@ -232,13 +246,18 @@ pub struct Endpoint {
     channels: ChannelSet,
 
     connections: Slab<ServerConnection>,
-    /// Tickets already accepted, so a retried handshake reaches the connection
-    /// it created rather than making another.
-    accepted: HashMap<u64, Handle<ServerConnection>>,
+
+    /// Tickets already spent, so a retried handshake reaches the connection
+    /// it created and a replayed one is refused.
+    redeemed: HashMap<TicketId, Redeemed>,
+    /// Spent tickets in order of expiry, so they are forgotten without a scan.
+    redeemed_expiry: BinaryHeap<Reverse<(Timestamp, TicketId)>>,
+
     /// Connection ids are monotonic rather than slot-derived, because a
     /// slot-derived id would repeat once its per-slot counter wrapped, and an id
     /// must not repeat while a session's keys are live.
     routes: HashMap<ConnectionId, Handle<ServerConnection>>,
+
     sessions: HashMap<SessionId, Session>,
 
     acceptor: Acceptor,
@@ -279,7 +298,8 @@ impl Endpoint {
             config,
             channels: *channels,
             connections: Slab::with_capacity(config.capacity),
-            accepted: HashMap::with_capacity(reserve),
+            redeemed: HashMap::with_capacity(reserve),
+            redeemed_expiry: BinaryHeap::with_capacity(reserve),
             routes: HashMap::with_capacity(reserve),
             sessions: HashMap::with_capacity(reserve),
             acceptor: Acceptor::new(backend_key),
@@ -442,12 +462,21 @@ impl Endpoint {
             return Action::Dropped(DropReason::Handshake(error));
         }
 
-        let Some(nonce) = request_nonce(&buf[..len]) else {
+        let (Some(nonce), Some(ticket_id)) = (request_nonce(&buf[..len]), TicketId::of_request(&buf[..len])) else {
             return Action::Dropped(DropReason::Malformed);
         };
 
+        // Refused here rather than only at the response, so a replayed ticket
+        // costs the server no cookie.
+        if let Some(Redeemed { connection: None }) = self.redeemed.get(&ticket_id) {
+            return Action::Dropped(DropReason::Handshake(HandshakeError::Spent));
+        }
+
         let mut cookie = [0u8; MAX_BLOB];
-        let cookie_len = match self.acceptor.encrypt_cookie(ctx.now, from, nonce, &ticket, &mut cookie) {
+        let cookie_len = match self
+            .acceptor
+            .encrypt_cookie(ctx.now, from, nonce, ticket_id, &ticket, &mut cookie)
+        {
             Ok(cookie_len) => cookie_len,
             Err(error) => return Action::Dropped(DropReason::Handshake(error)),
         };
@@ -475,19 +504,23 @@ impl Endpoint {
             return Action::Dropped(DropReason::Handshake(HandshakeError::Expired));
         }
 
-        // A client whose acceptance was lost retries with the same cookie. The
-        // ticket is the identity: re-send the acceptance on the connection it
-        // already produced rather than creating a second one.
+        // A spent ticket produces nothing new. While its connection lives, a
+        // response presenting it is a client whose acceptance was lost: re-send
+        // the acceptance there, which a replay from elsewhere gains nothing by,
+        // since it goes to the connection's own address. Once the connection
+        // has ended, the ticket is simply refused.
         //
         // Checked before the ticket, because accepting a resume turns its
-        // session from suspended to live, which is exactly what `check_ticket`
-        // rejects. A retry would otherwise be refused rather than recognised.
-        if let Some(&handle) = self.accepted.get(&cookie.ticket.token_id) {
-            if let Some(conn) = self.connection_mut(handle) {
+        // session from suspended to live, which `check_ticket` would treat as
+        // a takeover rather than a retry.
+        if let Some(redeemed) = self.redeemed.get(&cookie.ticket_id) {
+            if let Some(handle) = redeemed.connection
+                && let Some(conn) = self.connection_mut(handle)
+            {
                 conn.resend_acceptance();
                 return Action::Connected(handle);
             }
-            self.accepted.remove(&cookie.ticket.token_id);
+            return Action::Dropped(DropReason::Handshake(HandshakeError::Spent));
         }
 
         // Rechecked here as well as at the request: up to COOKIE_LIFETIME has
@@ -521,7 +554,7 @@ impl Endpoint {
             ctx.now,
             conn_id,
             session,
-            cookie.ticket.token_id,
+            cookie.ticket_id,
             from,
             &keys,
             self.channels,
@@ -535,7 +568,6 @@ impl Endpoint {
 
         // Consumed only on success, so a failed insert does not burn an id.
         self.next_conn_id = self.next_conn_id.wrapping_add(1);
-        // The slot may have belonged to a connection since retired.
         self.schedules[ix(handle)] = Schedule::default();
         self.touch(handle);
         self.routes.insert(conn_id, handle);
@@ -546,7 +578,10 @@ impl Endpoint {
                 state: SessionState::Live(handle),
             },
         );
-        self.accepted.insert(cookie.ticket.token_id, handle);
+        self.redeemed
+            .insert(cookie.ticket_id, Redeemed { connection: Some(handle) });
+        self.redeemed_expiry
+            .push(Reverse((cookie.ticket.expires_at, cookie.ticket_id)));
 
         self.events.push(Event::Connected { handle, session, resumed });
         Action::Connected(handle)
@@ -636,6 +671,19 @@ impl Endpoint {
         }
         self.reap(ctx.now);
         self.expire_sessions(ctx.now);
+        self.forget_expired_tickets(ctx.now);
+    }
+
+    /// Forgets spent tickets past their expiry. They need no deadline of
+    /// their own. Holding one longer only costs memory, and `check_ticket`
+    /// refuses an expired ticket regardless.
+    fn forget_expired_tickets(&mut self, now: Timestamp) {
+        while let Some(&Reverse((expires_at, ticket_id))) = self.redeemed_expiry.peek()
+            && (expires_at < now)
+        {
+            self.redeemed_expiry.pop();
+            self.redeemed.remove(&ticket_id);
+        }
     }
 
     /// The earliest time `handle_timeout` or `drain_transmits` next has work,
@@ -734,13 +782,16 @@ impl Endpoint {
         self.pump_events(handle);
 
         let Some(conn) = self.connections.get(handle) else { return };
-        let (conn_id, session, token_id) = (conn.id(), conn.session(), conn.token_id());
+        let (conn_id, session, ticket_id) = (conn.id(), conn.session(), conn.ticket_id());
 
         let schedule = &mut self.schedules[ix(handle)];
         let reason = schedule.closed_with.unwrap_or(CloseReason::TimedOut);
 
         self.routes.remove(&conn_id);
-        self.accepted.remove(&token_id);
+        // The ticket stays spent until it expires. Only the retry path closes.
+        if let Some(redeemed) = self.redeemed.get_mut(&ticket_id) {
+            redeemed.connection = None;
+        }
         self.connections.remove(handle);
         self.schedules[ix(handle)] = Schedule::default();
 

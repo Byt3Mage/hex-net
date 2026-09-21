@@ -155,8 +155,8 @@ impl Pair {
 
     /// Builds a pair whose client already holds a ticket for the server.
     ///
-    /// `client_id` and `token_id` are the backend's to choose; one ticket per
-    /// connection attempt is all the server requires.
+    /// `client_id` is the are the backend's to choose. A ticket is spent by the
+    /// handshake it completes, so each connection needs a fresh one.
     pub fn with_latency(channels: ChannelSet, client_id: u64, latency: Duration) -> Self {
         let now = Timestamp::ZERO;
         let backend_key: Key = [0x5A; 32];
@@ -164,7 +164,7 @@ impl Pair {
         let client_addr: SocketAddr = str::parse("10.0.0.2:40000").expect("literal address");
 
         let keys = session_keys(client_id);
-        let ticket = issue_ticket(&backend_key, now, client_id, client_id, None, &keys);
+        let ticket = issue_ticket(&backend_key, now, client_id, None, &keys);
 
         Self {
             now,
@@ -545,14 +545,12 @@ pub fn session_keys(seed: u64) -> Keys {
 pub fn issue_ticket(
     backend_key: &Key,
     now: Timestamp,
-    token_id: u64,
     client_id: u64,
     session: Option<SessionId>,
     keys: &Keys,
 ) -> EncryptedTicket {
     let ticket = Ticket {
         expires_at: now.saturating_add(Duration::from_secs(60)),
-        token_id,
         client_id,
         session,
         keys: *keys,

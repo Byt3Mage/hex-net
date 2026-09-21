@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     bits::{BitReader, BitWriter, ReadError, WriteError},
-    crypto::{self, Key, Keys, MAX_BLOB},
+    crypto::{self, Key, Keys, MAX_BLOB, NONCE_LEN},
     fixed::FixedVec,
     time::Timestamp,
     wire::{ClientNonce, HANDSHAKE_LEN, PROTOCOL_ID, handshake_blob},
@@ -30,15 +30,16 @@ pub const RESUME_TICKET_LIFETIME: Duration = Duration::from_secs(180);
 pub const MAX_USER_DATA: usize = 256;
 
 /// Worst-case plaintext sizes.
-pub const MAX_TICKET: usize = 128 + MAX_USER_DATA;
-pub const MAX_COOKIE: usize = MAX_TICKET + 40;
+pub const MAX_TICKET: usize = MAX_USER_DATA + 128;
+pub const MAX_COOKIE: usize = MAX_TICKET + 48;
 
 const _: () = {
     // A change to MAX_USER_DATA fails the build rather than truncating a ticket
-    // at runtime. The ticket's fixed part is 98 bytes. A cookie prefixes at
-    // most 27 for an IPv6 address with its family tag and port.
-    assert!(MAX_TICKET >= (MAX_USER_DATA + 98));
-    assert!(MAX_COOKIE >= (MAX_TICKET + 27 + ClientNonce::LEN));
+    // at runtime. The ticket's fixed part is 90 bytes. A cookie prefixes at
+    // most 27 for an IPv6 address with its family tag and port, then the
+    // client's nonce and the ticket's identity.
+    assert!(MAX_TICKET >= (MAX_USER_DATA + 90));
+    assert!(MAX_COOKIE >= (MAX_TICKET + 27 + ClientNonce::LEN + TicketId::LEN));
     assert!(MAX_BLOB >= (MAX_COOKIE + 28));
 };
 
@@ -53,14 +54,29 @@ pub type UserData = FixedVec<u8, MAX_USER_DATA>;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(pub u64);
 
+/// A sealed ticket's identity from the random nonce it was sealed under.
+///
+/// Every sealing draws a fresh one, so two sealed tickets never share an
+/// identity, whatever their contents. That is what lets a ticket be spent
+/// exactly once without the backend having to number its tickets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TicketId(pub [u8; NONCE_LEN]);
+
+impl TicketId {
+    pub const LEN: usize = NONCE_LEN;
+
+    pub fn of_request(packet: &[u8]) -> Option<Self> {
+        let blob = handshake_blob(packet)?;
+        let nonce = blob.get(..Self::LEN)?;
+        Some(Self(nonce.try_into().ok()?))
+    }
+}
+
 /// The client's credential: sealed by the backend for a new player, or by this
 /// server for a resuming one. Opaque to the client.
 #[derive(Debug, Clone, Copy)]
 pub struct Ticket {
     pub expires_at: Timestamp,
-    /// Unique per issued ticket. Lets the server recognise a retried handshake
-    /// as the same one rather than accepting it twice.
-    pub token_id: u64,
     pub client_id: u64,
     /// `None` for a new player; `Some` names the session being resumed.
     pub session: Option<SessionId>,
@@ -79,6 +95,9 @@ pub struct Cookie {
     /// The nonce the client's request carried. Sealed here, so the server
     /// derives the connection's keys from what the client actually sent.
     pub nonce: ClientNonce,
+    /// Which sealed ticket the request presented, so the response spends that
+    /// one and no other.
+    pub ticket_id: TicketId,
     pub ticket: Ticket,
 }
 
@@ -92,6 +111,8 @@ pub enum HandshakeError {
     AddressMismatch,
     /// Names a session that has expired or is not suspended.
     NoSession,
+    /// Already produced a connection. A ticket is good for one.
+    Spent,
     Malformed,
 }
 
@@ -136,11 +157,13 @@ impl Acceptor {
         now: Timestamp,
         addr: SocketAddr,
         nonce: ClientNonce,
+        ticket_id: TicketId,
         ticket: &Ticket,
         out: &mut [u8],
     ) -> Result<usize, HandshakeError> {
         let mut plain = [0u8; MAX_COOKIE];
-        let len = encode_cookie(now, addr, nonce, ticket, &mut plain).map_err(|_| HandshakeError::Malformed)?;
+        let len =
+            encode_cookie(now, addr, nonce, ticket_id, ticket, &mut plain).map_err(|_| HandshakeError::Malformed)?;
         let aad = PROTOCOL_ID.to_le_bytes();
         crypto::encrypt_blob(&self.server_key, &plain[..len], &aad, out).map_err(|_| HandshakeError::Malformed)
     }
@@ -185,7 +208,6 @@ fn encode_ticket(t: &Ticket, out: &mut [u8; MAX_TICKET]) -> Result<usize, WriteE
     let mut w = BitWriter::new(out);
 
     w.write_u64(t.expires_at.as_nanos())?;
-    w.write_u64(t.token_id)?;
     w.write_u64(t.client_id)?;
     w.write_bool(t.session.is_some())?;
     w.write_u64(t.session.unwrap_or_default().0)?;
@@ -204,7 +226,6 @@ fn decode_ticket(bytes: &[u8]) -> Result<Ticket, HandshakeError> {
         let mut r = BitReader::new(bytes);
 
         let expires_at = Timestamp::from_nanos(r.read_u64()?);
-        let token_id = r.read_u64()?;
         let client_id = r.read_u64()?;
         let has_session = r.read_bool()?;
         let session_id = r.read_u64()?;
@@ -219,7 +240,6 @@ fn decode_ticket(bytes: &[u8]) -> Result<Ticket, HandshakeError> {
 
         Ok(Ticket {
             expires_at,
-            token_id,
             client_id,
             session: has_session.then_some(SessionId(session_id)),
             keys: Keys { client_to_server, server_to_client },
@@ -229,11 +249,12 @@ fn decode_ticket(bytes: &[u8]) -> Result<Ticket, HandshakeError> {
     read(bytes).map_err(|_| HandshakeError::Malformed)
 }
 
-/// Layout: `[issued_at | address family | address | port | nonce | ticket]`
+/// Layout: `[issued_at | address family | address | port | nonce | ticket_id | ticket]`
 fn encode_cookie(
     now: Timestamp,
     addr: SocketAddr,
     nonce: ClientNonce,
+    ticket_id: TicketId,
     ticket: &Ticket,
     out: &mut [u8; MAX_COOKIE],
 ) -> Result<usize, WriteError> {
@@ -257,6 +278,9 @@ fn encode_cookie(
 
     out[at..at + ClientNonce::LEN].copy_from_slice(&nonce.0.to_le_bytes());
     at += ClientNonce::LEN;
+
+    out[at..at + TicketId::LEN].copy_from_slice(&ticket_id.0);
+    at += TicketId::LEN;
 
     let plain = out[at..at + MAX_TICKET].as_mut_array().ok_or(WriteError::OutOfRange)?;
     at += encode_ticket(ticket, plain)?;
@@ -286,12 +310,16 @@ fn decode_cookie(bytes: &[u8]) -> Result<Cookie, HandshakeError> {
     let nonce = u64::from_le_bytes(slice(at..at + ClientNonce::LEN)?.try_into().expect("checked length"));
     at += ClientNonce::LEN;
 
+    let ticket_id = slice(at..at + TicketId::LEN)?.try_into().expect("checked length");
+    at += TicketId::LEN;
+
     let ticket = decode_ticket(slice(at..bytes.len())?)?;
 
     Ok(Cookie {
         issued_at: Timestamp::from_nanos(issued),
         addr: SocketAddr::new(ip, port),
         nonce: ClientNonce(nonce),
+        ticket_id: TicketId(ticket_id),
         ticket,
     })
 }

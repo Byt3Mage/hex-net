@@ -15,7 +15,7 @@ use crate::{
     crypto::{ConnectionKeys, Key, MAX_BLOB},
     ctx::Ctx,
     fixed::RingQueue,
-    handshake::{EncryptedTicket, SessionId},
+    handshake::{EncryptedTicket, SessionId, TicketId},
     packet::{DecryptError, Packet, PacketCrypto},
     seq::{Sequence, WindowError},
     stats::{Counter, Counters},
@@ -157,9 +157,9 @@ pub struct Client {
 /// Validates any address change before trusting it, and issues resume tickets.
 pub struct Server {
     session: SessionId,
-    /// The ticket this connection was accepted from, so a retried handshake can
-    /// be recognised and the connection released from the accepted table.
-    token_id: u64,
+    /// The sealed ticket this connection was accepted from, so the endpoint can
+    /// mark it spent when the connection ends.
+    ticket: TicketId,
     /// Queued until the acceptance frame has gone out.
     pending_accept: bool,
     probe: Option<Probe>,
@@ -826,7 +826,7 @@ impl Connection<Server> {
         now: Timestamp,
         id: ConnectionId,
         session: SessionId,
-        token_id: u64,
+        ticket: TicketId,
         addr: SocketAddr,
         keys: &ConnectionKeys,
         channels: ChannelSet,
@@ -841,7 +841,7 @@ impl Connection<Server> {
             budget,
             Server {
                 session,
-                token_id,
+                ticket,
                 pending_accept: true,
                 probe: None,
                 pending_path_challenge: None,
@@ -864,8 +864,8 @@ impl Connection<Server> {
 
     /// The ticket this connection was accepted from.
     #[inline]
-    pub fn token_id(&self) -> u64 {
-        self.role.token_id
+    pub fn ticket_id(&self) -> TicketId {
+        self.role.ticket
     }
 
     /// The address being probed, if any. A packet sent to the primary address is

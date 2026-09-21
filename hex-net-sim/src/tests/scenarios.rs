@@ -249,3 +249,90 @@ fn a_ticket_cannot_resume_another_players_session() {
     assert_eq!(world.client(0).connector().state(), State::Connected);
     assert_eq!(world.client_app(0).echoes, (0..TOTAL).collect::<Vec<u32>>());
 }
+
+/// A ticket is good for one connection. Once that connection has ended, the
+/// same sealed ticket is refused, so a captured request cannot be replayed.
+#[test]
+fn a_spent_ticket_cannot_connect_again() {
+    let mut world = world(29, 1, TOTAL);
+    world.run_for(Duration::from_secs(2)).expect("progress");
+    assert_eq!(world.server_app().connected, 1);
+
+    world.crash_client(0);
+    world.run_for(PAST_IDLE_TIMEOUT).expect("progress");
+    assert_eq!(world.server().endpoint().num_connections(), 0);
+
+    world.replay_ticket(0, Chatter::new(0, TOTAL, SEND_INTERVAL));
+    world.run_for(Duration::from_secs(10)).expect("progress");
+
+    assert_eq!(world.server_app().connected, 1, "the replay produced no connection");
+    assert_eq!(world.server().endpoint().num_connections(), 0);
+    assert_ne!(world.client(0).connector().state(), State::Connected);
+}
+
+/// The damaging case: a resume ticket replayed after its connection ended
+/// would otherwise reattach the suspended session to whoever sent it.
+#[test]
+fn a_replayed_resume_ticket_cannot_reclaim_the_session() {
+    let mut world = world(30, 1, TOTAL);
+    world.run_for(Duration::from_secs(2)).expect("progress");
+    let session = world.server_app().sessions[0];
+
+    world.reconnect_client(0, session, Chatter::new(0, TOTAL, SEND_INTERVAL));
+    world.run_for(Duration::from_secs(2)).expect("progress");
+    assert_eq!(world.server_app().resumed, 1);
+
+    world.crash_client(0);
+    world.run_for(PAST_IDLE_TIMEOUT).expect("progress");
+
+    world.replay_ticket(0, Chatter::new(0, TOTAL, SEND_INTERVAL));
+    world.run_for(Duration::from_secs(10)).expect("progress");
+
+    assert_eq!(world.server_app().resumed, 1, "the replay did not resume the session");
+    assert_eq!(world.server().endpoint().num_connections(), 0);
+    assert_ne!(world.client(0).connector().state(), State::Connected);
+
+    world.run_for(PAST_RESUME_GRACE).expect("progress");
+    assert_eq!(
+        world.server_app().expired,
+        vec![session],
+        "the session lapsed untouched"
+    );
+}
+
+/// The attack this closes: while a player is live on a newer ticket, an older
+/// one of theirs, captured off the wire and still unexpired, is replayed from
+/// elsewhere. Accepting it would take the session over and kick the player,
+/// so it must be refused as spent.
+#[test]
+fn a_replayed_old_ticket_cannot_kick_a_live_player() {
+    let mut world = world(31, 1, TOTAL);
+    world.run_for(Duration::from_secs(2)).expect("progress");
+    let session = world.server_app().sessions[0];
+
+    world.reconnect_client(0, session, Chatter::new(0, TOTAL, SEND_INTERVAL));
+    world.run_for(Duration::from_secs(2)).expect("progress");
+    let captured = world.ticket(0);
+
+    // The player moves on to a newer ticket; the captured one's connection
+    // is replaced and ends.
+    world.reconnect_client(0, session, Chatter::new(0, TOTAL, SEND_INTERVAL));
+    world.run_for(Duration::from_secs(2)).expect("progress");
+    assert_eq!(world.server_app().resumed, 2);
+    let endings_before = world.server_app().endings.len();
+
+    let attacker = world.add_client_with_ticket(link(), link(), captured, Chatter::new(1, TOTAL, SEND_INTERVAL));
+    world.run_for(Duration::from_secs(20)).expect("progress");
+
+    assert_eq!(world.server_app().resumed, 2, "the replay took nothing over");
+    assert_eq!(
+        world.server_app().endings.len(),
+        endings_before,
+        "{:?}",
+        world.server_app().endings
+    );
+    assert_ne!(world.client(attacker).connector().state(), State::Connected);
+    assert_eq!(world.server().endpoint().num_connections(), 1);
+    assert_eq!(world.client(0).connector().state(), State::Connected);
+    assert_eq!(world.client_app(0).echoes, (0..TOTAL).collect::<Vec<u32>>());
+}
