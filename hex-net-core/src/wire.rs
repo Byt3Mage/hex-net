@@ -138,7 +138,6 @@ impl Header {
             // encode ackbits
             if self.ack_bits != 0 {
                 flags |= flags::ACK_BITS;
-
                 out[at..at + 4].copy_from_slice(&self.ack_bits.to_le_bytes());
                 at += 4;
             }

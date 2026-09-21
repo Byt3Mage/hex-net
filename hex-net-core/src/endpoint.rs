@@ -191,7 +191,7 @@ struct Schedule {
     retiring: bool,
     /// Why the connection closed, kept from the event that annouced it so
     /// retirement still knows even though events are drained as they arrived.
-    closed_with: Option<CloseReason>,
+    closed_with: CloseReason,
 }
 
 /// One connection's deadline in the timer heap. Ordered earliest first, ties
@@ -524,7 +524,7 @@ impl Endpoint {
             return Action::Dropped(DropReason::Handshake(HandshakeError::Spent));
         }
 
-        // Rechecked here as well as at the request: up to COOKIE_LIFETIME has
+        // Rechecked here as well as at the request. Up to COOKIE_LIFETIME has
         // passed, during which a grace period may have lapsed or another
         // response may already have claimed the session.
         if let Err(error) = self.check_ticket(ctx.now, &cookie.ticket) {
@@ -628,13 +628,26 @@ impl Endpoint {
             // Its slot's bookkeeping now belongs to whatever occupies
             // the slot.
             let Some(conn) = self.connections.get_mut(handle) else { continue };
-            self.schedules[ix(handle)].ready = false;
+            let schedule = &mut self.schedules[ix(handle)];
+            schedule.ready = false;
 
             if let Some(len) = conn.poll_transmit(ctx, slot) {
                 sink.commit(Destinations { primary: conn.addr(), probe: conn.probe_addr() }, len);
             }
 
-            self.rearm(handle);
+            // Arms the connection's timer at its current deadline, or queue it for
+            // removal once it has closed.
+            // Only a deadline earlier than the armed one is pushed. A later one waits
+            // for the armed entry to surface, whose service rearms it.
+            if let Some(at) = conn.next_timeout() {
+                if schedule.armed.is_none_or(|armed| at < armed) {
+                    schedule.armed = Some(at);
+                    self.timers.push(Timer { at, handle });
+                }
+            } else if !schedule.retiring {
+                schedule.retiring = true;
+                self.retiring.push_back(handle);
+            }
         }
     }
 
@@ -674,11 +687,11 @@ impl Endpoint {
     /// their own. Holding one longer only costs memory, and `check_ticket`
     /// refuses an expired ticket regardless.
     fn forget_expired_tickets(&mut self, now: Timestamp) {
-        while let Some(&Reverse((expires_at, ticket_id))) = self.redeemed_expiry.peek()
-            && (expires_at < now)
+        while let Some(&Reverse((at, id))) = self.redeemed_expiry.peek()
+            && (at < now)
         {
             self.redeemed_expiry.pop();
-            self.redeemed.remove(&ticket_id);
+            self.redeemed.remove(&id);
         }
     }
 
@@ -725,7 +738,7 @@ impl Endpoint {
         }
 
         if let Some(reason) = closed {
-            self.schedules[ix(handle)].closed_with = Some(reason);
+            self.schedules[ix(handle)].closed_with = reason;
         }
     }
 
@@ -738,31 +751,6 @@ impl Endpoint {
         }
     }
 
-    /// Arms a connection's timer at its current deadline, or queues it for
-    /// removal once it has closed.
-    ///
-    /// Only a deadline earlier than the armed one is pushed. A later one waits
-    /// for the armed entry to surface, whose service rearms it. Deadlines move
-    /// earlier only through a datagram, a timer, or the application, and each
-    /// of those queues a transmit that ends here.
-    fn rearm(&mut self, handle: Handle<ServerConnection>) {
-        let Some(conn) = self.connections.get(handle) else { return };
-        let schedule = &mut self.schedules[ix(handle)];
-        match conn.next_timeout() {
-            Some(at) => {
-                if schedule.armed.is_none_or(|armed| at < armed) {
-                    schedule.armed = Some(at);
-                    self.timers.push(Timer { at, handle });
-                }
-            }
-            None => {
-                if !schedule.retiring {
-                    schedule.retiring = true;
-                    self.retiring.push_back(handle);
-                }
-            }
-        }
-    }
     /// Removes closed connections and decides whether their session survives.
     ///
     /// A player who disconnected on purpose is gone. One who dropped may be
@@ -779,17 +767,15 @@ impl Endpoint {
 
         let Some(conn) = self.connections.get(handle) else { return };
         let (conn_id, session, ticket_id) = (conn.id(), conn.session(), conn.ticket_id());
+        let reason = core::mem::take(&mut self.schedules[ix(handle)]).closed_with;
 
-        let schedule = &mut self.schedules[ix(handle)];
-        let reason = schedule.closed_with.unwrap_or(CloseReason::TimedOut);
-
-        self.routes.remove(&conn_id);
         // The ticket stays spent until it expires. Only the retry path closes.
         if let Some(redeemed) = self.redeemed.get_mut(&ticket_id) {
             redeemed.connection = None;
         }
+
+        self.routes.remove(&conn_id);
         self.connections.remove(handle);
-        self.schedules[ix(handle)] = Schedule::default();
 
         let mut suspended = false;
 

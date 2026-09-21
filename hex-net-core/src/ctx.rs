@@ -16,11 +16,4 @@ impl<'a> Ctx<'a> {
     pub fn new(now: Timestamp, counters: &'a mut Counters) -> Self {
         Self { now, counters }
     }
-
-    /// The same counters at a different instant, for a batch whose datagrams
-    /// carry individual receive timestamps.
-    #[inline]
-    pub fn at(&mut self, now: Timestamp) -> Ctx<'_> {
-        Ctx { now, counters: self.counters }
-    }
 }

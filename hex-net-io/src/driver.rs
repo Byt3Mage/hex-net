@@ -211,7 +211,7 @@ impl<S: Socket> ServerDriver<S> {
     /// Returns when to call again if no datagram arrives first. A time at or
     /// before `now` means immediately.
     pub fn step(&mut self, now: Timestamp, app: &mut impl ServerApp) -> io::Result<Option<Timestamp>> {
-        self.receive(now, app)?;
+        self.receive(app)?;
 
         let mut ctx = Ctx::new(now, &mut self.counters);
         self.endpoint.handle_timeout(&mut ctx);
@@ -225,17 +225,15 @@ impl<S: Socket> ServerDriver<S> {
         Ok(earliest(self.endpoint.next_timeout(), app.next_wake()))
     }
 
-    fn receive(&mut self, now: Timestamp, app: &mut impl ServerApp) -> io::Result<()> {
+    fn receive(&mut self, app: &mut impl ServerApp) -> io::Result<()> {
         loop {
             let count = self.inbox.fill(&mut self.socket)?;
             for index in 0..count {
                 let received = self.inbox.received[index];
                 // The kernel's arrival time, not ours, so scheduling delay stays
                 // out of every RTT sample.
-                let mut ctx = Ctx::new(now, &mut self.counters);
-                let mut ctx = ctx.at(received.at);
                 let action = self.endpoint.handle_datagram(
-                    &mut ctx,
+                    &mut Ctx::new(received.at, &mut self.counters),
                     received.from,
                     &mut self.inbox.packets[index],
                     received.len.min(MAX_DATAGRAM),
@@ -320,7 +318,7 @@ impl<S: Socket> ClientDriver<S> {
     /// Sends at most one packet. A connection builds one per call, and whatever
     /// is left over makes the returned deadline immediate.
     pub fn step(&mut self, now: Timestamp, app: &mut impl ClientApp) -> io::Result<Option<Timestamp>> {
-        self.receive(now, app)?;
+        self.receive(app)?;
 
         let mut ctx = Ctx::new(now, &mut self.counters);
         let _ = self.connector.handle_timeout(&mut ctx);
@@ -341,16 +339,14 @@ impl<S: Socket> ClientDriver<S> {
         Ok(earliest(self.connector.next_timeout(), app.next_wake()))
     }
 
-    fn receive(&mut self, now: Timestamp, app: &mut impl ClientApp) -> io::Result<()> {
+    fn receive(&mut self, app: &mut impl ClientApp) -> io::Result<()> {
         let server = self.connector.server();
         loop {
             let count = self.inbox.fill(&mut self.socket)?;
             for index in 0..count {
                 let received = self.inbox.received[index];
-                let mut ctx = Ctx::new(now, &mut self.counters);
-                let mut ctx = ctx.at(received.at);
                 let action = self.connector.handle_datagram(
-                    &mut ctx,
+                    &mut Ctx::new(received.at, &mut self.counters),
                     received.from,
                     &mut self.inbox.packets[index],
                     received.len.min(MAX_DATAGRAM),

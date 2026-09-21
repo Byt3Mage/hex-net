@@ -41,11 +41,12 @@ const PROBE_MESSAGES: usize = 2;
 /// How long an unproven path is probed before it is abandoned.
 const PATH_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum CloseReason {
     /// The application asked to disconnect.
     Requested = 0,
+    #[default]
     TimedOut = 1,
     /// An authenticated peer sent something the protocol does not allow.
     ProtocolViolation = 2,
@@ -93,7 +94,7 @@ pub enum Event {
 
 impl Default for Event {
     fn default() -> Self {
-        Event::Closed(CloseReason::Requested)
+        Event::Closed(CloseReason::default())
     }
 }
 
@@ -394,7 +395,7 @@ impl<R: Role> Connection<R> {
 
     /// Builds the next packet, if there is one. Returns its length in `buf`.
     ///
-    /// One packet per call: coalescing everything for a peer into a single
+    /// One packet per call. Coalescing everything for a peer into a single
     /// datagram amortizes 28 bytes of IP and UDP overhead plus our header and
     /// the authentication tag.
     pub fn poll_transmit(&mut self, ctx: &mut Ctx, out: &mut Packet) -> Option<usize> {
