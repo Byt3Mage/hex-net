@@ -2,30 +2,24 @@
 //! event loop would drive them: each node is stepped only when a datagram has
 //! landed for it or a deadline it reported has come.
 
-use std::{
-    cell::{Cell, RefCell},
-    cmp::Ordering,
-    collections::{BTreeSet, BinaryHeap, HashMap},
-    net::{Ipv4Addr, SocketAddr},
-    rc::Rc,
-    time::Duration,
-};
+use std::cell::{Cell, RefCell};
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
+use std::net::{Ipv4Addr, SocketAddr};
+use std::rc::Rc;
+use std::time::Duration;
 
-use hex_net_core::{
-    budget::BudgetConfig,
-    channel::ChannelSet,
-    connector::Connector,
-    crypto::{Key, Keys},
-    endpoint::{Endpoint, EndpointConfig},
-    handshake::{EncryptedTicket, SessionId},
-    time::Timestamp,
-};
+use hex_net_core::budget::BudgetConfig;
+use hex_net_core::channel::ChannelSet;
+use hex_net_core::connector::Connector;
+use hex_net_core::crypto::{Key, Keys};
+use hex_net_core::endpoint::{Endpoint, EndpointConfig};
+use hex_net_core::handshake::{EncryptedTicket, SessionId};
+use hex_net_core::time::Timestamp;
 use hex_net_io::driver::{ClientApp, ClientDriver, ServerApp, ServerDriver};
 
-use crate::{
-    net::{Link, SimSocket, Wire, WireStats},
-    pair::{issue_ticket, session_keys},
-};
+use crate::net::{Link, SimSocket, Wire, WireStats};
+use crate::pair::{issue_ticket, session_keys};
 
 /// Steps at one instant before the run is declared stuck: some deadline stays
 /// due however often its node is stepped.
@@ -72,7 +66,10 @@ impl PartialOrd for Wake {
 struct Client<C> {
     driver: ClientDriver<SimSocket>,
     app: C,
+    /// Shared with the socket, so a rebinding moves both.
     addr: Rc<Cell<SocketAddr>>,
+    /// A crashed client is never stepped again: no timers, no transmits,
+    /// nothing read. What the server sent it simply piles up unread.
     crashed: bool,
 }
 
@@ -133,25 +130,8 @@ impl<S: ServerApp, C: ClientApp> World<S, C> {
     /// index.
     pub fn add_client(&mut self, up: Link, down: Link, app: C) -> usize {
         let index = self.clients.len();
-        let [a, b] = u16::try_from(index + 1).expect("at most 65,535 clients").to_be_bytes();
-        let addr = SocketAddr::from((Ipv4Addr::new(10, 1, a, b), 40_000));
-
-        let addr = Rc::new(Cell::new(addr));
-        self.wire.borrow_mut().add_path(addr.get(), up, down);
-
-        let socket = SimSocket::new(Rc::clone(&self.wire), Rc::clone(&addr));
-        let connector = self.new_connector(index, None);
-
-        self.clients.push(Client {
-            driver: ClientDriver::new(socket, connector),
-            app,
-            addr: Rc::clone(&addr),
-            crashed: false,
-        });
-
-        self.addresses.insert(addr.get(), Node::Client(index));
-        self.pending.insert(Node::Client(index));
-        index
+        let ticket = issue_ticket(&BACKEND_KEY, self.now, (index as u64) + 1, None, &self.keys(index));
+        self.add_client_with_ticket(up, down, ticket, app)
     }
 
     /// A connector for a client with a freshly sealed ticket, resuming
@@ -161,17 +141,23 @@ impl<S: ServerApp, C: ClientApp> World<S, C> {
         self.connector_with(index, ticket)
     }
 
+    /// Every ticket for a client carries the same session keys, deliberately:
+    /// the transport binds each connection's keys to its own handshake, so a
+    /// reconnect must work even when a backend reuses them.
     fn keys(&self, index: usize) -> Keys {
         session_keys(self.seed ^ ((index as u64) + 1))
     }
 
+    /// A connector presenting `ticket`, remembered as the client's latest so
+    /// it can be replayed.
     fn connector_with(&mut self, index: usize, ticket: EncryptedTicket) -> Connector {
         self.tickets.insert(index, ticket);
+        let keys = self.keys(index);
         Connector::connect(
             self.now,
             self.server_addr,
             ticket,
-            self.keys(index),
+            keys,
             self.channels,
             BudgetConfig::DEFAULT,
         )
@@ -212,14 +198,15 @@ impl<S: ServerApp, C: ClientApp> World<S, C> {
         self.replace_driver(index, connector, app);
     }
 
-    /// Stops a client dead. Like a crashed process, it stops reading or sending,
-    /// and never informs the server.
+    /// Stops a client dead, as a crashed process does: it stops reading,
+    /// stops sending, and never says goodbye.
     pub fn crash_client(&mut self, index: usize) {
         self.clients[index].crashed = true;
         self.pending.remove(&Node::Client(index));
         self.armed.remove(&Node::Client(index));
     }
 
+    /// Closes a client's connection with a notice, as quitting does.
     pub fn close_client(&mut self, index: usize) {
         self.clients[index].driver.connector_mut().close();
         self.pending.insert(Node::Client(index));
@@ -250,6 +237,7 @@ impl<S: ServerApp, C: ClientApp> World<S, C> {
 
     fn replace_driver(&mut self, index: usize, connector: Connector, app: C) {
         let socket = SimSocket::new(Rc::clone(&self.wire), Rc::clone(&self.clients[index].addr));
+
         let client = &mut self.clients[index];
         client.driver = ClientDriver::new(socket, connector);
         client.app = app;
@@ -378,7 +366,6 @@ impl<S: ServerApp, C: ClientApp> World<S, C> {
                 due.insert(node);
             }
         }
-
         due.retain(|node| match node {
             Node::Server => true,
             Node::Client(index) => !self.clients[*index].crashed,

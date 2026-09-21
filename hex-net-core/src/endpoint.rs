@@ -455,9 +455,10 @@ impl Endpoint {
         }
 
         let ticket = match self.acceptor.decrypt_ticket(&buf[..len]) {
-            Ok(ticket) => ticket,
-            Err(error) => return Action::Dropped(DropReason::Handshake(error)),
+            Ok(t) => t,
+            Err(err) => return Action::Dropped(DropReason::Handshake(err)),
         };
+
         if let Err(error) = self.check_ticket(ctx.now, &ticket) {
             return Action::Dropped(DropReason::Handshake(error));
         }
@@ -608,13 +609,8 @@ impl Endpoint {
             // noticed it was gone (usually in a crash). The new connection takes
             // over the session.
             SessionState::Live(_) => Ok(()),
-            SessionState::Suspended { since } => {
-                if now.saturating_since(since) < RESUME_GRACE {
-                    Ok(())
-                } else {
-                    Err(HandshakeError::NoSession)
-                }
-            }
+            SessionState::Suspended { since } if now.saturating_since(since) < RESUME_GRACE => Ok(()),
+            SessionState::Suspended { .. } => Err(HandshakeError::NoSession),
         }
     }
 

@@ -219,7 +219,7 @@ pub fn encode_request(ticket: &[u8], nonce: ClientNonce, out: &mut [u8]) -> Resu
         return Err(WriteError::Overflow);
     }
     let len = encode_handshake(PacketKind::Request, ticket, out)?;
-    out[at..(at + ClientNonce::LEN)].copy_from_slice(&nonce.0.to_le_bytes());
+    out[at..at + ClientNonce::LEN].copy_from_slice(&nonce.0.to_le_bytes());
     Ok(len)
 }
 

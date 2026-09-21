@@ -176,13 +176,14 @@ pub fn encrypt_blob(key: &Key, blob: &[u8], aad: &[u8], out: &mut [u8]) -> Resul
 
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::fill(&mut nonce).map_err(|_| CryptoError)?;
-
     out[..NONCE_LEN].copy_from_slice(&nonce);
+
     let body_end = NONCE_LEN + blob.len();
-    out[NONCE_LEN..body_end].copy_from_slice(blob);
+    let body = &mut out[NONCE_LEN..body_end];
+    body.copy_from_slice(blob);
 
     let tag = ChaCha20Poly1305::new(&(*key).into())
-        .encrypt_inout_detached(&nonce.into(), aad, InOutBuf::from(&mut out[NONCE_LEN..body_end]))
+        .encrypt_inout_detached(&nonce.into(), aad, InOutBuf::from(body))
         .map_err(|_| CryptoError)?;
 
     out[body_end..end].copy_from_slice(tag.as_slice());
