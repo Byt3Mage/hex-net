@@ -2,9 +2,45 @@
 
 use core::range::Range;
 
-use crate::crypto::{Cipher, CryptoError, Key, TAG_LEN};
-use crate::seq::{self, ReceiveWindow, Sequence, WindowError, WireSequence};
-use crate::wire::{ConnectionId, Header, MAX_DATAGRAM, PacketKind};
+use crate::{
+    crypto::{Cipher, CryptoError, Key, TAG_LEN},
+    seq::{ReceiveWindow, Sequence, WindowError, WireSequence},
+    time::Timestamp,
+    wire::{ConnectionId, Header, MAX_DATAGRAM, PacketKind},
+};
+
+/// A sealed datagram: the sequence it went out under and its length.
+///
+/// Only `encrypt` builds one, so the sequence is the one actually used for
+/// the nonce and the length is bounded by `MAX_DATAGRAM`.
+#[derive(Clone, Copy, Debug)]
+pub struct Sealed {
+    sequence: Sequence,
+    len: u16,
+}
+
+impl Sealed {
+    #[inline]
+    pub fn sequence(&self) -> Sequence {
+        self.sequence
+    }
+
+    /// Datagram length in bytes, header and tag included.
+    #[inline]
+    pub fn datagram_len(&self) -> u16 {
+        self.len
+    }
+}
+/// What the outgoing header reports about received traffic.
+#[derive(Clone, Copy, Debug)]
+pub struct AckState {
+    /// Newest ack-eliciting sequence received.
+    pub newest: Sequence,
+    /// Bit i set means (newest - 1 - i) was received.
+    pub bits: u32,
+    /// When `newest` arrived, so the header can report how long it was held.
+    pub received_at: Timestamp,
+}
 
 /// A claim on the next outgoing sequence.
 ///
@@ -52,16 +88,17 @@ pub struct PacketCrypto {
     tx: Cipher,
     rx: Cipher,
     next_sequence: Sequence,
-    /// Every received sequence. Guards against replay and against reusing a
+    /// Every received sequence. Guards against replay and reusing a
     /// nonce, so it must record packets of every kind.
     replay: ReceiveWindow,
-    /// Received sequences worth acknowledging.
+    /// Received sequences that should be acknowledged.
     ///
     /// Separate from the replay window because a peer does not acknowledge
     /// packets that carry only acknowledgements, and so does not track them.
-    /// Reporting one as the newest received would name a packet the peer has no
-    /// record of, which costs it every round-trip sample.
     acked: ReceiveWindow,
+    /// When `acked`'s newest entry arrived. The reported delay must describe
+    /// the packet the acknowledgement names, not whichever arrived first.
+    newest_acked_at: Timestamp,
 }
 
 impl PacketCrypto {
@@ -74,6 +111,7 @@ impl PacketCrypto {
             next_sequence: Sequence::FIRST,
             replay: ReceiveWindow::default(),
             acked: ReceiveWindow::default(),
+            newest_acked_at: Timestamp::ZERO,
         }
     }
 
@@ -82,22 +120,31 @@ impl PacketCrypto {
         SequenceTicket(self.next_sequence)
     }
 
-    /// The newest sequence worth acknowledging, for the outgoing header.
+    /// What the outgoing header should acknowledge, or `None` before any
+    /// ack-eliciting packet has arrived.
     #[inline]
-    pub fn newest_acknowledged(&self) -> Sequence {
-        self.acked.newest()
-    }
-
-    #[inline]
-    pub fn ack_bits(&self) -> u32 {
-        self.acked.ack_bits()
+    pub fn ack_state(&self) -> Option<AckState> {
+        Some(AckState {
+            newest: self.acked.newest()?,
+            bits: self.acked.ack_bits(),
+            received_at: self.newest_acked_at,
+        })
     }
 
     /// Records a received packet as worth acknowledging. Called once the frames
     /// have been read and the packet is known to carry more than acknowledgements.
     #[inline]
-    pub fn record_eliciting(&mut self, sequence: Sequence) {
+    pub fn record_eliciting(&mut self, sequence: Sequence, now: Timestamp) {
+        if self.acked.newest().is_none_or(|n| sequence > n) {
+            self.newest_acked_at = now;
+        }
         self.acked.insert(sequence);
+    }
+
+    /// Writes `header` and returns the writable body range, which excludes the
+    /// space `encrypt` needs for the tag.
+    pub fn begin(&self, header: &Header, buf: &mut Packet) -> core::ops::Range<usize> {
+        header.encode(buf)..(MAX_DATAGRAM - TAG_LEN)
     }
 
     /// Parses, checks, and decrypts one datagram in place.
@@ -111,7 +158,7 @@ impl PacketCrypto {
             return Err(DecryptError::Malformed);
         }
 
-        let sequence = seq::reconstruct(self.replay.newest(), header.sequence).ok_or(DecryptError::Malformed)?;
+        let sequence = Sequence::resolve(self.replay.newest(), header.sequence).ok_or(DecryptError::Malformed)?;
         self.replay.check(sequence).map_err(DecryptError::Replay)?;
 
         let body_len = self
@@ -128,31 +175,25 @@ impl PacketCrypto {
         })
     }
 
-    /// Writes `header` and returns the writable body range, which excludes the
-    /// space `encrypt` needs for the tag.
-    pub fn begin(&self, header: &Header, buf: &mut Packet) -> core::ops::Range<usize> {
-        header.encode(buf)..(MAX_DATAGRAM - TAG_LEN)
-    }
-
     /// Encrypts the body in place and appends the tag, consuming `ticket` and
-    /// with it the sequence number. Returns the datagram length.
+    /// with it the sequence number.
     pub fn encrypt(
         &mut self,
         ticket: SequenceTicket,
         buf: &mut Packet,
         header_len: usize,
         body_end: usize,
-    ) -> Result<usize, CryptoError> {
+    ) -> Result<Sealed, CryptoError> {
+        const { assert!(MAX_DATAGRAM <= (u16::MAX as usize)) };
         let len = self.tx.encrypt(ticket.0.get(), buf, header_len, body_end)?;
         self.next_sequence = ticket.0.next();
-        Ok(len)
+        Ok(Sealed { sequence: ticket.0, len: len as u16 })
     }
 
     /// Resolves a peer's acknowledgement, rejecting anything ahead of our own
     /// counter: a peer cannot acknowledge a packet that was never sent.
     pub fn resolve_ack(&self, wire: WireSequence) -> Option<Sequence> {
-        let newest_sent = self.next_sequence.saturating_sub(1);
-        let ack = seq::reconstruct(newest_sent, wire)?;
-        (ack <= newest_sent).then_some(ack)
+        let newest_sent = self.next_sequence.checked_sub(1)?;
+        Sequence::resolve(Some(newest_sent), wire).filter(|&ack| ack <= newest_sent)
     }
 }

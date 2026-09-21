@@ -3,17 +3,19 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::budget::BudgetConfig;
-use crate::channel::{ChannelSet, OnMessage};
-use crate::connection::{Client, CloseReason, Connection, Event as ConnEvent, RecvError};
-use crate::crypto::{Keys, MAX_BLOB};
-use crate::ctx::Ctx;
-use crate::fixed::FixedVec;
-use crate::handshake::EncryptedTicket;
-use crate::packet::Packet;
-use crate::stats::Counter;
-use crate::time::Timestamp;
-use crate::wire::{HANDSHAKE_LEN, Header, PacketKind, encode_handshake, handshake_blob};
+use crate::{
+    budget::BudgetConfig,
+    channel::{ChannelSet, OnMessage},
+    connection::{Client, CloseReason, Connection, Event as ConnEvent, RecvError},
+    crypto::{Keys, MAX_BLOB},
+    ctx::Ctx,
+    fixed::FixedVec,
+    handshake::EncryptedTicket,
+    packet::Packet,
+    stats::Counter,
+    time::Timestamp,
+    wire::{ClientNonce, HANDSHAKE_LEN, Header, PacketKind, encode_handshake, encode_request, handshake_blob},
+};
 
 /// Handshake steps are resent on this interval until answered.
 const RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -60,6 +62,9 @@ pub struct Connector {
     ticket: FixedVec<u8, MAX_BLOB>,
     /// The cookie from the challenge, echoed until the server accepts it.
     cookie: Option<FixedVec<u8, MAX_BLOB>>,
+    /// Drawn once for this attempt and sent with every request, retries
+    /// included, so every cookie the server issues for it seals the same one.
+    nonce: ClientNonce,
 
     /// Known before the handshake: a new player's keys arrive from the backend
     /// alongside the ticket, and a resuming player already holds them.
@@ -96,6 +101,7 @@ impl Connector {
             state: State::Requesting,
             ticket,
             cookie: None,
+            nonce: ClientNonce::random(),
             keys,
             channels,
             budget,
@@ -113,6 +119,12 @@ impl Connector {
     #[inline]
     pub fn connection(&self) -> Option<&Connection<Client>> {
         self.connection.as_ref()
+    }
+
+    /// The one address this client talks to.
+    #[inline]
+    pub fn server(&self) -> SocketAddr {
+        self.server
     }
 
     #[inline]
@@ -187,14 +199,8 @@ impl Connector {
             return Action::Done;
         };
 
-        let mut conn = Connection::connect(
-            ctx.now,
-            header.conn_id,
-            self.server,
-            &self.keys,
-            self.channels,
-            self.budget,
-        );
+        let keys = self.keys.for_connection(header.conn_id, self.nonce);
+        let mut conn = Connection::connect(ctx.now, header.conn_id, self.server, &keys, self.channels, self.budget);
 
         // Verified by decrypting: a forged acceptance cannot authenticate, and
         // failing here leaves the cookie retrying, since the real acceptance may
@@ -258,12 +264,11 @@ impl Connector {
 
     /// Writes the current handshake step, padded to HANDSHAKE_LEN.
     fn write_handshake(&self, out: &mut Packet) -> Option<usize> {
-        let (kind, blob): (PacketKind, &[u8]) = match self.state {
-            State::Requesting => (PacketKind::Request, &self.ticket),
-            State::Responding => (PacketKind::Response, self.cookie.as_ref()?),
-            _ => return None,
-        };
-        encode_handshake(kind, blob, out).ok()
+        match self.state {
+            State::Requesting => encode_request(&self.ticket, self.nonce, out).ok(),
+            State::Responding => encode_handshake(PacketKind::Response, self.cookie.as_ref()?, out).ok(),
+            _ => None,
+        }
     }
 
     pub fn handle_timeout(&mut self, ctx: &mut Ctx) -> Action {

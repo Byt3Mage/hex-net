@@ -1,83 +1,83 @@
 //! Packet numbering: the basis of loss detection, duplicate rejection,
 //! acknowledgement, and AEAD nonce uniqueness.
 
-use core::fmt;
+use core::{fmt, num::NonZeroU64};
 
-/// A packet's position in one direction of one connection. Starts at 1; zero
-/// means none yet.
+/// A packet's position in one direction of one connection. Starts at 1.
+///
+/// Nonzero, so "no packet yet" is `Option<Sequence>`.
 ///
 /// Full width in memory, truncated to sixteen bits on the wire, so only
-/// `reconstruct` ever deals with wraparound.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Sequence(u64);
+/// `resolve` ever deals with wraparound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Sequence(NonZeroU64);
 
-/// The sixteen bits of a sequence carried in a packet header.
+/// The sixteen bits of a counter carried in a packet.
 ///
-/// Kept distinct from `Sequence` because a wire value is ambiguous until
+/// Kept distinct from the full value because a wire value is ambiguous until
 /// resolved against a reference point.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct WireSequence(pub u16);
 
 impl Sequence {
-    pub const NONE: Sequence = Sequence(0);
-    pub const FIRST: Sequence = Sequence(1);
+    pub const FIRST: Self = Self(NonZeroU64::MIN);
 
-    /// Builds a sequence from a raw counter value. Used where another
-    /// monotonic counter borrows the reconstruction rule.
     #[inline]
-    pub const fn from_raw(value: u64) -> Sequence {
-        Sequence(value)
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
     }
 
     #[inline]
     pub const fn get(self) -> u64 {
-        self.0
+        self.0.get()
     }
 
     #[inline]
-    pub const fn is_none(self) -> bool {
-        self.0 == 0
-    }
-
-    #[inline]
-    pub fn next(self) -> Sequence {
-        Sequence(self.0.checked_add(1).expect("sequence overflow"))
+    pub fn next(self) -> Self {
+        Self(self.0.checked_add(1).expect("sequence overflow"))
     }
 
     #[inline]
     pub const fn to_wire(self) -> WireSequence {
-        WireSequence(self.0 as u16)
+        WireSequence(self.0.get() as u16)
     }
 
+    /// The sequence `n` before this one, or `None` when that would reach zero.
     #[inline]
-    pub fn checked_since(self, earlier: Sequence) -> Option<u64> {
-        self.0.checked_sub(earlier.0)
+    pub fn checked_sub(self, n: u64) -> Option<Self> {
+        self.get().checked_sub(n).and_then(Sequence::new)
     }
 
+    /// Resolves a wire value to the full sequence nearest `reference`, where
+    /// `None` means nothing has been seen yet and resolves against zero.
     #[inline]
-    pub fn saturating_sub(self, n: u64) -> Sequence {
-        Sequence(self.0.saturating_sub(n))
+    pub fn resolve(reference: Option<Sequence>, wire: WireSequence) -> Option<Sequence> {
+        reconstruct(reference.map_or(0, Sequence::get), wire).and_then(Sequence::new)
     }
 }
 
 impl fmt::Display for Sequence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.get())
     }
 }
 
-/// Resolves a wire value to the full sequence nearest `reference`.
+/// Resolves sixteen wire bits to the full counter value nearest `reference`.
 ///
-/// Correct while the true sequence is within 32,767 of the reference. At any
-/// realistic packet rate that is far longer than a connection survives
-/// without traffic, so the idle timeout closes the connection long before the
-/// window is at risk.
+/// Shared by every monotonic counter that travels truncated: packet
+/// sequences, message ids, and ticks. Correct while the true value is within
+/// 32,767 of the reference. At any realistic packet rate that is far longer
+/// than a connection survives without traffic, so the idle timeout closes the
+/// connection long before the window is at risk.
 ///
 /// Returns `None` when the nearest candidate would be negative.
 #[inline]
-pub fn reconstruct(reference: Sequence, wire: WireSequence) -> Option<Sequence> {
-    let delta = (wire.0.wrapping_sub(reference.0 as u16) as i16) as i64;
-    reference.0.checked_add_signed(delta).map(Sequence)
+pub fn reconstruct(reference: u64, wire: WireSequence) -> Option<u64> {
+    let delta = (wire.0.wrapping_sub(reference as u16) as i16) as i64;
+    reference.checked_add_signed(delta)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +93,7 @@ pub enum WindowError {
 /// fields in outgoing headers.
 #[derive(Debug, Default, Clone)]
 pub struct ReceiveWindow {
-    newest: Sequence,
+    newest: Option<Sequence>,
     /// Bit i set means (newest - i) was received; bit 0 is `newest` itself.
     mask: u64,
 }
@@ -102,11 +102,12 @@ impl ReceiveWindow {
     /// Whether a sequence may be accepted. Commits nothing.
     #[inline]
     pub fn check(&self, seq: Sequence) -> Result<(), WindowError> {
-        if seq > self.newest {
+        let Some(newest) = self.newest else { return Ok(()) };
+        if seq > newest {
             return Ok(());
         }
-        let offset = self.newest.0 - seq.0;
-        if seq.is_none() || (offset >= 64) {
+        let offset = newest.get() - seq.get();
+        if offset >= 64 {
             return Err(WindowError::TooOld);
         }
         if (self.mask & (1 << offset)) != 0 {
@@ -119,24 +120,31 @@ impl ReceiveWindow {
     /// authenticated: committing an unauthenticated sequence would let one
     /// forged packet advance the window past all genuine traffic.
     #[inline]
-    pub fn insert(&mut self, seq: Sequence) {
-        if seq > self.newest {
-            let shift = seq.0 - self.newest.0;
-            // A shift of 64 or more is undefined, and leaves nothing in range
-            // regardless.
-            self.mask = if shift >= 64 { 0 } else { self.mask << shift };
-            self.mask |= 1;
-            self.newest = seq;
-        } else {
-            let offset = self.newest.0 - seq.0;
-            if offset < 64 {
-                self.mask |= 1 << offset;
+    pub fn insert(&mut self, sequence: Sequence) {
+        match self.newest {
+            Some(newest) if sequence <= newest => {
+                let offset = newest.get() - sequence.get();
+                if offset < 64 {
+                    self.mask |= 1 << offset;
+                }
+            }
+            Some(newest) => {
+                let shift = sequence.get() - newest.get();
+                // A shift of 64 or more is undefined, and leaves nothing in
+                // range regardless.
+                self.mask = if shift >= 64 { 0 } else { self.mask << shift };
+                self.mask |= 1;
+                self.newest = Some(sequence);
+            }
+            None => {
+                self.mask = 1;
+                self.newest = Some(sequence);
             }
         }
     }
 
     #[inline]
-    pub fn newest(&self) -> Sequence {
+    pub fn newest(&self) -> Option<Sequence> {
         self.newest
     }
 
@@ -147,66 +155,66 @@ impl ReceiveWindow {
     }
 }
 
+struct Entry<T> {
+    seq: Sequence,
+    item: T,
+}
+
 /// A fixed ring keyed by sequence number.
 ///
 /// `N` is a compile-time power of two, so a slot is a mask against an
-/// immediate. Entries are overwritten once the ring wraps.
+/// immediate. An insert that lands on an occupied slot evicts the occupant and
+/// returns it, so the caller always learns what was displaced.
 pub struct SequenceBuffer<T, const N: usize> {
-    /// Which sequence owns each slot; `Sequence::NONE` marks it free.
-    seqs: [Sequence; N],
-    items: [T; N],
+    /// `Sequence` is nonzero, so an empty slot costs no extra space.
+    slots: [Option<Entry<T>>; N],
 }
 
-impl<T: Default + Copy, const N: usize> Default for SequenceBuffer<T, N> {
+impl<T, const N: usize> Default for SequenceBuffer<T, N> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Default + Copy, const N: usize> SequenceBuffer<T, N> {
+impl<T, const N: usize> SequenceBuffer<T, N> {
     pub fn new() -> Self {
-        const { assert!(N.is_power_of_two() && (N > 0)) };
-        Self {
-            seqs: [Sequence::NONE; N],
-            items: [T::default(); N],
-        }
+        const { assert!(N > 0 && N.is_power_of_two()) };
+        Self { slots: [const { None }; N] }
     }
 
     #[inline(always)]
     fn slot(seq: Sequence) -> usize {
-        (seq.0 as usize) & (N - 1)
+        (seq.get() as usize) & (N - 1)
     }
 
+    /// Stores `item` under `seq`, returning whatever the slot held before.
     #[inline]
-    pub fn insert(&mut self, seq: Sequence, item: T) {
-        debug_assert!(!seq.is_none());
-        let at = Self::slot(seq);
-        self.seqs[at] = seq;
-        self.items[at] = item;
+    pub fn insert(&mut self, seq: Sequence, item: T) -> Option<(Sequence, T)> {
+        self.slots[Self::slot(seq)]
+            .replace(Entry { seq, item })
+            .map(|evicted| (evicted.seq, evicted.item))
     }
 
     #[inline]
     pub fn get(&self, seq: Sequence) -> Option<&T> {
-        let at = Self::slot(seq);
-        ((!seq.is_none()) && (self.seqs[at] == seq)).then(|| &self.items[at])
+        self.slots[Self::slot(seq)]
+            .as_ref()
+            .and_then(|e| (e.seq == seq).then_some(&e.item))
     }
 
     #[inline]
     pub fn get_mut(&mut self, seq: Sequence) -> Option<&mut T> {
-        let at = Self::slot(seq);
-        if seq.is_none() || (self.seqs[at] != seq) {
-            return None;
-        }
-        Some(&mut self.items[at])
+        self.slots[Self::slot(seq)]
+            .as_mut()
+            .and_then(|e| (e.seq == seq).then_some(&mut e.item))
     }
 
     #[inline]
     pub fn remove(&mut self, seq: Sequence) -> Option<T> {
-        let at = Self::slot(seq);
-        if seq.is_none() || (self.seqs[at] != seq) {
-            return None;
+        let slot = &mut self.slots[Self::slot(seq)];
+        match slot {
+            Some(entry) if entry.seq == seq => slot.take().map(|entry| entry.item),
+            _ => None,
         }
-        self.seqs[at] = Sequence::NONE;
-        Some(core::mem::take(&mut self.items[at]))
     }
 }

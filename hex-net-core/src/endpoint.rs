@@ -1,30 +1,63 @@
 //! The server's front door: routing, handshakes, and session lifetime.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::hash::{BuildHasher, RandomState};
+use std::marker::PhantomData;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use crate::budget::BudgetConfig;
-use crate::channel::{ChannelSet, OnMessage};
-use crate::connection::{CloseReason, Connection, Event as ConnEvent, RecvError, Server};
-use crate::crypto::{Key, MAX_BLOB};
-use crate::ctx::Ctx;
-use crate::fixed::{FixedVec, RingQueue};
-use crate::handshake::{Acceptor, COOKIE_LIFETIME, EncryptedTicket, HandshakeError, RESUME_GRACE, SessionId, Ticket};
-use crate::packet::Packet;
-use crate::slab::{Handle, Slab};
-use crate::stats::Counter;
-use crate::time::Timestamp;
-use crate::wire::{ConnectionId, HANDSHAKE_LEN, Header, PacketKind, encode_handshake};
+use crate::{
+    budget::BudgetConfig,
+    channel::ChannelSet,
+    connection::{CloseReason, Connection, Event as ConnEvent, RecvError, Server},
+    crypto::{Key, MAX_BLOB},
+    ctx::Ctx,
+    fixed::RingQueue,
+    handshake::{Acceptor, COOKIE_LIFETIME, EncryptedTicket, HandshakeError, RESUME_GRACE, SessionId, Ticket},
+    packet::Packet,
+    slab::{Handle, Slab},
+    stats::Counter,
+    time::Timestamp,
+    wire::{ConnectionId, HANDSHAKE_LEN, Header, PacketKind, encode_handshake, request_nonce},
+};
 
-/// Handshake packets allowed per source address per second. A legitimate client
-/// sends two; a few retries are normal.
-const HANDSHAKE_BURST: u16 = 8;
-const HANDSHAKE_REFILL_INTERVAL: Duration = Duration::from_millis(125);
+#[inline(always)]
+const fn ix(handle: Handle<ServerConnection>) -> usize {
+    handle.index() as usize
+}
 
-/// Handshake packets processed per service pass, bounding the decryption work a
-/// distributed flood can force regardless of how many addresses it uses.
-const GLOBAL_HANDSHAKE_BUDGET: u16 = 256;
+/// Handshake packets allowed per source IP. A burst of 32, then 16 a second.
+/// A legitimate client sends two plus a few retries. The headroom is for a
+/// carrier-grade NAT putting many players behind one address during a
+/// reconnect storm.
+struct PerAddress;
+
+impl RefillPolicy for PerAddress {
+    const BURST: u32 = 32;
+    const INTERVAL: Duration = Duration::from_micros(62500);
+}
+
+/// Handshake requests processed per second across all sources, bounding the
+/// decryption work a distributed flood can force regardless of how many
+/// addresses it uses. 8,000 a second admits a full 10k reconnect in about a
+/// second, at roughly a microsecond of AEAD work each.
+struct GlobalRequests;
+
+impl RefillPolicy for GlobalRequests {
+    const BURST: u32 = 1024;
+    const INTERVAL: Duration = Duration::from_micros(125);
+}
+
+/// The same bound for cookie echoes, held separately. A response proves its
+/// sender receives at its address, so a flood of spoofed requests must not be
+/// able to starve the clients completing a handshake.
+struct GlobalResponses;
+
+impl RefillPolicy for GlobalResponses {
+    const BURST: u32 = GlobalRequests::BURST;
+    const INTERVAL: Duration = GlobalRequests::INTERVAL;
+}
 
 /// How many closures or expiries are processed per pass. The remainder is picked
 /// up next pass, so a mass disconnection does not produce an unbounded burst
@@ -36,9 +69,9 @@ const REAP_BATCH: usize = 64;
 #[derive(Clone, Copy, Debug)]
 pub struct EndpointConfig {
     pub capacity: u32,
-    /// Rate-limiter slots. Direct-mapped, so distinct addresses can share a
-    /// bucket; oversizing relative to `capacity` makes that rare, and a shared
-    /// bucket only throttles.
+    /// Rate-limiter slots. Direct-mapped, under a keyed hash, so distinct
+    /// addresses occasionally share a bucked. Oversizing relative to
+    /// `capacity` makes that rare, and a shared bucket only throttles.
     pub limiter_slots: usize,
     pub budget: BudgetConfig,
 }
@@ -55,6 +88,10 @@ impl EndpointConfig {
 
 /// Every connection an endpoint owns is a server-side one.
 pub type ServerConnection = Connection<Server>;
+
+/// Called with each delivered message and the connection it arrived on, during
+/// the call that received it. The payload borrows the packet buffer.
+pub type OnServerMessage<'a> = &'a mut dyn FnMut(Handle<ServerConnection>, u8, &[u8]);
 
 /// What the caller should do with a datagram.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +135,12 @@ pub enum Event {
     },
     /// The grace period lapsed; the avatar can be removed.
     SessionExpired(SessionId),
+    /// The peer now arrives from a new address, which has been verified.
+    Migrated {
+        handle: Handle<ServerConnection>,
+        session: SessionId,
+        addr: SocketAddr,
+    },
 }
 
 impl Default for Event {
@@ -106,19 +149,60 @@ impl Default for Event {
     }
 }
 
-/// A connection retired this pass.
-#[derive(Clone, Copy)]
-struct Closure {
-    conn_id: ConnectionId,
-    session: SessionId,
-    token_id: u64,
-    reason: CloseReason,
-}
-
 #[derive(Clone, Copy)]
 enum SessionState {
     Live(Handle<ServerConnection>),
     Suspended { since: Timestamp },
+}
+
+/// A session in the world, kept across the connections that carry it.
+#[derive(Clone, Copy)]
+struct Session {
+    /// The `client_id` of the ticket that created it. Only a ticket for the
+    /// same player may resume it.
+    owner: u64,
+    state: SessionState,
+}
+/// The endpoint's bookkeeping for one connection slot, kept beside the slab so
+/// a connection carries nothing about how it is scheduled. Reset whenever the
+/// slot changes hands.
+#[derive(Clone, Copy, Default)]
+struct Schedule {
+    /// The deadline of this slot's live timer entry. An entry carrying any
+    /// other time is stale and is skipped when it surfaces.
+    armed: Option<Timestamp>,
+    /// Queued in `ready`.
+    ready: bool,
+    /// Queued in `retiring`.
+    retiring: bool,
+    /// Why the connection closed, kept from the event that annouced it so
+    /// retirement still knows even though events are drained as they arrived.
+    closed_with: Option<CloseReason>,
+}
+
+/// One connection's deadline in the timer heap. Ordered earliest first, ties
+/// broken by slot so equal deadlines are serviced in a reproducible order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Timer {
+    at: Timestamp,
+    handle: Handle<ServerConnection>,
+}
+
+impl Ord for Timer {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reversed, because `BinaryHeap` pops its greatest entry first.
+        other
+            .at
+            .cmp(&self.at)
+            .then_with(|| other.handle.index().cmp(&self.handle.index()))
+            .then_with(|| other.handle.generation().cmp(&self.handle.generation()))
+    }
+}
+
+impl PartialOrd for Timer {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Where a packet should go. Two addresses while a connection is validating a
@@ -155,17 +239,32 @@ pub struct Endpoint {
     /// slot-derived id would repeat once its per-slot counter wrapped, and an id
     /// must not repeat while a session's keys are live.
     routes: HashMap<ConnectionId, Handle<ServerConnection>>,
-    sessions: HashMap<SessionId, SessionState>,
+    sessions: HashMap<SessionId, Session>,
 
     acceptor: Acceptor,
     limiter: RateLimiter,
 
+    requests: Bucket<GlobalRequests>,
+    responses: Bucket<GlobalResponses>,
+
     next_conn_id: u32,
     next_session_id: u64,
-    handshake_budget: u16,
-    /// Where the next transmit pass begins, so a sink that fills does not starve
-    /// the same connections every pass.
-    resume_at: u32,
+
+    /// Indexed by a handle's slot.
+    schedules: Box<[Schedule]>,
+    /// Each connection's next deadline, so a timer pass visits only the
+    /// connections that are due rather than every connection.
+    timers: BinaryHeap<Timer>,
+    /// Connections that may have something to send, e.g., touched by a datagram,
+    /// timer, or the application since they last transmitted. First in, first
+    /// out, so a sink that fills resumes where it stopped.
+    ready: VecDeque<Handle<ServerConnection>>,
+    /// Closed connections awaiting removal.
+    retiring: VecDeque<Handle<ServerConnection>>,
+    /// Suspended sessions in order of suspension, which is also the order their
+    /// grace periods lapse. An entry whose session has since resumed, or been
+    /// suspended again, no longer matches the session table and is skipped.
+    suspended: VecDeque<(Timestamp, SessionId)>,
 
     events: RingQueue<Event, 64>,
 }
@@ -185,12 +284,17 @@ impl Endpoint {
             sessions: HashMap::with_capacity(reserve),
             acceptor: Acceptor::new(backend_key),
             limiter: RateLimiter::new(config.limiter_slots),
+            requests: Bucket::full(),
+            responses: Bucket::full(),
             // Starts above zero so a restarted server does not immediately
             // reissue ids that clients from the previous run still hold.
             next_conn_id: 1,
             next_session_id: 1,
-            handshake_budget: GLOBAL_HANDSHAKE_BUDGET,
-            resume_at: 0,
+            schedules: vec![Schedule::default(); config.capacity as usize].into(),
+            timers: BinaryHeap::with_capacity(reserve),
+            ready: VecDeque::with_capacity(reserve),
+            retiring: VecDeque::with_capacity(reserve),
+            suspended: VecDeque::with_capacity(reserve),
             events: RingQueue::new(),
         }
     }
@@ -205,8 +309,15 @@ impl Endpoint {
         self.connections.get(handle)
     }
 
+    /// Mutable access, for sending or closing. The connection is queued to
+    /// transmit on the next drain, since whatever the caller does may give it
+    /// something to send.
     #[inline]
     pub fn connection_mut(&mut self, handle: Handle<ServerConnection>) -> Option<&mut ServerConnection> {
+        if !self.connections.contains(handle) {
+            return None;
+        }
+        self.touch(handle);
         self.connections.get_mut(handle)
     }
 
@@ -216,8 +327,8 @@ impl Endpoint {
     }
 
     #[inline]
-    pub fn connections_mut(&mut self) -> &mut [ServerConnection] {
-        self.connections.as_mut_slice()
+    pub fn handles(&mut self) -> impl Iterator<Item = Handle<ServerConnection>> + '_ {
+        self.connections.iter().map(|(h, _)| h)
     }
 
     #[inline]
@@ -240,8 +351,8 @@ impl Endpoint {
     ) -> Result<(), HandshakeError> {
         let mut encrypted = [0u8; MAX_BLOB];
         let len = self.acceptor.encrypt_resume_ticket(now, ticket, &mut encrypted)?;
-        let conn = self.connections.get_mut(handle).ok_or(HandshakeError::NoSession)?;
         let stored = EncryptedTicket::from_slice(&encrypted[..len]).ok_or(HandshakeError::Malformed)?;
+        let conn = self.connection_mut(handle).ok_or(HandshakeError::NoSession)?;
         conn.send_resume_ticket(stored);
         Ok(())
     }
@@ -256,7 +367,7 @@ impl Endpoint {
         buf: &mut Packet,
         len: usize,
         out: &mut Packet,
-        on_message: OnMessage,
+        on_message: OnServerMessage,
     ) -> Action {
         let Some(kind) = peek_kind(buf, len) else {
             ctx.counters.inc(Counter::PacketsMalformed);
@@ -284,7 +395,7 @@ impl Endpoint {
         from: SocketAddr,
         buf: &mut Packet,
         len: usize,
-        on_message: OnMessage,
+        on_message: OnServerMessage,
     ) -> Action {
         let Ok((header, _)) = Header::decode(&buf[..len]) else {
             ctx.counters.inc(Counter::PacketsMalformed);
@@ -300,8 +411,13 @@ impl Endpoint {
             return Action::Dropped(DropReason::UnknownConnection);
         };
 
-        match conn.handle_datagram(ctx, from, buf, len, on_message) {
-            Ok(()) | Err(RecvError::BadPayload) => Action::Routed(handle),
+        let mut forward = |channel: u8, payload: &[u8]| on_message(handle, channel, payload);
+        match conn.handle_datagram(ctx, from, buf, len, &mut forward) {
+            Ok(()) | Err(RecvError::BadPayload) => {
+                self.touch(handle);
+                self.pump_events(handle);
+                Action::Routed(handle)
+            }
             Err(_) => Action::Dropped(DropReason::Rejected),
         }
     }
@@ -314,7 +430,7 @@ impl Endpoint {
         len: usize,
         out: &mut Packet,
     ) -> Action {
-        if let Err(reason) = self.charge_handshake(ctx, from) {
+        if let Err(reason) = self.charge_handshake(ctx, from, PacketKind::Request) {
             return Action::Dropped(reason);
         }
 
@@ -326,8 +442,12 @@ impl Endpoint {
             return Action::Dropped(DropReason::Handshake(error));
         }
 
+        let Some(nonce) = request_nonce(&buf[..len]) else {
+            return Action::Dropped(DropReason::Malformed);
+        };
+
         let mut cookie = [0u8; MAX_BLOB];
-        let cookie_len = match self.acceptor.encrypt_cookie(ctx.now, from, &ticket, &mut cookie) {
+        let cookie_len = match self.acceptor.encrypt_cookie(ctx.now, from, nonce, &ticket, &mut cookie) {
             Ok(cookie_len) => cookie_len,
             Err(error) => return Action::Dropped(DropReason::Handshake(error)),
         };
@@ -339,7 +459,7 @@ impl Endpoint {
     }
 
     fn handle_response(&mut self, ctx: &mut Ctx, from: SocketAddr, buf: &Packet, len: usize) -> Action {
-        if let Err(reason) = self.charge_handshake(ctx, from) {
+        if let Err(reason) = self.charge_handshake(ctx, from, PacketKind::Response) {
             return Action::Dropped(reason);
         }
 
@@ -363,7 +483,7 @@ impl Endpoint {
         // session from suspended to live, which is exactly what `check_ticket`
         // rejects. A retry would otherwise be refused rather than recognised.
         if let Some(&handle) = self.accepted.get(&cookie.ticket.token_id) {
-            if let Some(conn) = self.connections.get_mut(handle) {
+            if let Some(conn) = self.connection_mut(handle) {
                 conn.resend_acceptance();
                 return Action::Connected(handle);
             }
@@ -377,24 +497,33 @@ impl Endpoint {
             return Action::Dropped(DropReason::Handshake(error));
         }
 
-        let resumed = cookie.ticket.session.is_some();
-        let session = match cookie.ticket.session {
-            Some(session) => session,
+        let (session, resumed) = match cookie.ticket.session {
+            Some(session) => (session, true),
             None => {
                 let session = SessionId(self.next_session_id);
                 self.next_session_id += 1;
-                session
+                (session, false)
             }
         };
 
+        // Taking over a live session closes the connection that held it.
+        // The notice goes out on the next drain and retirement follows.
+        if let Some(session) = self.sessions.get(&session)
+            && let SessionState::Live(prev) = session.state
+            && let Some(conn) = self.connection_mut(prev)
+        {
+            conn.close(CloseReason::Replaced);
+        }
+
         let conn_id = ConnectionId(self.next_conn_id);
+        let keys = cookie.ticket.keys.for_connection(conn_id, cookie.nonce);
         let conn = Connection::accept(
             ctx.now,
             conn_id,
             session,
             cookie.ticket.token_id,
             from,
-            &cookie.ticket.keys,
+            &keys,
             self.channels,
             self.config.budget,
         );
@@ -406,8 +535,17 @@ impl Endpoint {
 
         // Consumed only on success, so a failed insert does not burn an id.
         self.next_conn_id = self.next_conn_id.wrapping_add(1);
+        // The slot may have belonged to a connection since retired.
+        self.schedules[ix(handle)] = Schedule::default();
+        self.touch(handle);
         self.routes.insert(conn_id, handle);
-        self.sessions.insert(session, SessionState::Live(handle));
+        self.sessions.insert(
+            session,
+            Session {
+                owner: cookie.ticket.client_id,
+                state: SessionState::Live(handle),
+            },
+        );
         self.accepted.insert(cookie.ticket.token_id, handle);
 
         self.events.push(Event::Connected { handle, session, resumed });
@@ -422,134 +560,243 @@ impl Endpoint {
         }
 
         let Some(session) = ticket.session else { return Ok(()) };
+        let Some(record) = self.sessions.get(&session) else { return Err(HandshakeError::NoSession) };
 
-        match self.sessions.get(&session) {
-            Some(SessionState::Suspended { since }) if now.saturating_since(*since) <= RESUME_GRACE => Ok(()),
-            _ => Err(HandshakeError::NoSession),
+        // Another player's session is refused the same as a missing one is,
+        // so a ticket learns nothing about a session it doesn't own.
+        if record.owner != ticket.client_id {
+            return Err(HandshakeError::NoSession);
+        }
+
+        match record.state {
+            // Still attached. The player is reconnecting before the old connection
+            // noticed it was gone (usually in a crash). The new connection takes
+            // over the session.
+            SessionState::Live(_) => Ok(()),
+            SessionState::Suspended { since } => {
+                if now.saturating_since(since) < RESUME_GRACE {
+                    Ok(())
+                } else {
+                    Err(HandshakeError::NoSession)
+                }
+            }
         }
     }
 
-    /// Produces one packet per connection that has something to send.
+    /// Produces at most one packet for each connection that may have something
+    /// to send, then rearms its timer.
     ///
-    /// Visits connections from `resume_at`, which advances when a pass ends
-    /// early, so a sink that is consistently too small delays later connections
-    /// rather than starving them.
+    /// Visits only connections touched since they last transmitted. If the
+    /// sink fills, the rest stay queued and the next drain starts with them.
     pub fn drain_transmits(&mut self, ctx: &mut Ctx, sink: &mut impl PacketSink) {
-        let connections = self.connections.as_mut_slice();
-        if connections.is_empty() {
-            return;
+        while let Some(&handle) = self.ready.front() {
+            let Some(slot) = sink.next_slot() else { return };
+            self.ready.pop_front();
+
+            // A retired connection's handle can still be queued.
+            // Its slot's bookkeeping now belongs to whatever occupies
+            // the slot.
+            let Some(conn) = self.connections.get_mut(handle) else { continue };
+            self.schedules[ix(handle)].ready = false;
+
+            if let Some(len) = conn.poll_transmit(ctx, slot) {
+                sink.commit(Destinations { primary: conn.addr(), probe: conn.probe_addr() }, len);
+            }
+
+            self.rearm(handle);
         }
-
-        let start = (self.resume_at as usize) % connections.len();
-        for offset in 0..connections.len() {
-            let index = (start + offset) % connections.len();
-
-            let Some(slot) = sink.next_slot() else {
-                self.resume_at = index as u32;
-                return;
-            };
-
-            let conn = &mut connections[index];
-            let Some(len) = conn.poll_transmit(ctx, slot) else {
-                continue;
-            };
-            sink.commit(Destinations { primary: conn.addr(), probe: conn.probe_addr() }, len);
-        }
-        self.resume_at = 0;
     }
 
-    // ----------------------------------------------------------------- timers
-
-    /// Runs connection timers, retires closed connections, expires suspended
-    /// sessions, and refills the handshake budget.
+    /// Services the connections whose deadlines have passed, retires closed
+    /// connections, and expires suspended sessions.
+    ///
+    /// A serviced connection is queued to transmit, since a timer usually means
+    /// something is owed: an acknowledgement, a probe, a keepalive. Its timer is
+    /// rearmed after that transmit, not here, because deadlines such as an owed
+    /// acknowledgement stay due until the packet goes out.
     pub fn handle_timeout(&mut self, ctx: &mut Ctx) {
-        self.handshake_budget = GLOBAL_HANDSHAKE_BUDGET;
+        while let Some(&timer) = self.timers.peek()
+            && timer.at <= ctx.now
+        {
+            self.timers.pop();
+            if !self.connections.contains(timer.handle) {
+                continue;
+            }
+            let schedule = &mut self.schedules[ix(timer.handle)];
+            if schedule.armed != Some(timer.at) {
+                continue;
+            }
+            schedule.armed = None;
 
-        for conn in self.connections.as_mut_slice() {
-            conn.handle_timeout(ctx);
+            if let Some(conn) = self.connections.get_mut(timer.handle) {
+                conn.handle_timeout(ctx);
+            }
+            self.touch(timer.handle);
+            self.pump_events(timer.handle);
         }
         self.reap(ctx.now);
         self.expire_sessions(ctx.now);
     }
 
-    /// Removes closed connections and decides whether their session survives.
+    /// The earliest time `handle_timeout` or `drain_transmits` next has work,
+    /// or `None` when there is nothing to wait for.
     ///
-    /// A player who disconnected on purpose is gone; one who dropped may be
-    /// reconnecting already, so their place is held.
-    fn reap(&mut self, now: Timestamp) {
-        // Optional slots: an enum with no meaningful default should not be given
-        // one merely to satisfy a container.
-        let mut closed: FixedVec<Option<Closure>, REAP_BATCH> = FixedVec::new();
+    /// A connection queued to transmit or awaiting removal makes the answer
+    /// `Timestamp::ZERO`, i.e., already due, whatever the time. Stale timer
+    /// entries can make it earlier than necessary, never later.
+    pub fn next_timeout(&self) -> Option<Timestamp> {
+        if !self.ready.is_empty() || !self.retiring.is_empty() {
+            return Some(Timestamp::ZERO);
+        }
+        let timer = self.timers.peek().map(|timer| timer.at);
+        let session = self
+            .suspended
+            .front()
+            .map(|(since, _)| since.saturating_add(RESUME_GRACE));
+        timer.into_iter().chain(session).min()
+    }
 
-        for conn in self.connections.as_mut_slice() {
-            let mut reason = None;
-            // Drained fully, so a close is not missed behind other events.
-            while let Some(event) = conn.poll_event() {
-                if let ConnEvent::Closed(why) = event {
-                    reason = Some(why);
-                }
-            }
-            let reason = reason.or_else(|| conn.is_closed().then_some(CloseReason::TimedOut));
+    /// Moves a connection's events out to the endpoint's own queue.
+    ///
+    /// Run whenever a connection is serviced, so migrations reach the
+    /// application promptly rather than waiting for retirement, by which
+    /// time the connection's own queue may have overwritten them.
+    fn pump_events(&mut self, handle: Handle<ServerConnection>) {
+        let Some(conn) = self.connections.get_mut(handle) else { return };
+        let session = conn.session();
 
-            if let Some(reason) = reason {
-                let closure = Closure {
-                    conn_id: conn.id(),
-                    session: conn.session(),
-                    token_id: conn.token_id(),
-                    reason,
-                };
-                if !closed.push(Some(closure)) {
-                    break;
-                }
+        let mut migrated = None;
+        let mut closed = None;
+
+        while let Some(event) = conn.poll_event() {
+            match event {
+                ConnEvent::Migrated(addr) => migrated = Some(addr),
+                ConnEvent::Closed(reason) => closed = Some(reason),
+                ConnEvent::ResumeTicketReceived => { /*Client-only event*/ }
             }
         }
 
-        for closure in closed.iter().flatten().copied() {
-            let Some(handle) = self.routes.remove(&closure.conn_id) else { continue };
-            self.connections.remove(handle);
-            self.accepted.remove(&closure.token_id);
+        if let Some(addr) = migrated {
+            self.events.push(Event::Migrated { handle, session, addr });
+        }
 
-            let suspended = !matches!(closure.reason, CloseReason::Requested | CloseReason::ServerShutdown);
-            if suspended {
-                self.sessions
-                    .insert(closure.session, SessionState::Suspended { since: now });
-            } else {
-                self.sessions.remove(&closure.session);
-            }
-            self.events.push(Event::Disconnected {
-                session: closure.session,
-                reason: closure.reason,
-                suspended,
-            });
+        if let Some(reason) = closed {
+            self.schedules[ix(handle)].closed_with = Some(reason);
         }
     }
 
-    fn expire_sessions(&mut self, now: Timestamp) {
-        let mut expired: FixedVec<SessionId, REAP_BATCH> = FixedVec::new();
+    /// Queues a connection to transmit on the next drain.
+    fn touch(&mut self, handle: Handle<ServerConnection>) {
+        let schedule = &mut self.schedules[ix(handle)];
+        if !schedule.ready {
+            schedule.ready = true;
+            self.ready.push_back(handle);
+        }
+    }
 
-        for (&session, state) in self.sessions.iter() {
-            if let SessionState::Suspended { since } = state
-                && (now.saturating_since(*since) > RESUME_GRACE)
-                && !expired.push(session)
-            {
-                break;
+    /// Arms a connection's timer at its current deadline, or queues it for
+    /// removal once it has closed.
+    ///
+    /// Only a deadline earlier than the armed one is pushed. A later one waits
+    /// for the armed entry to surface, whose service rearms it. Deadlines move
+    /// earlier only through a datagram, a timer, or the application, and each
+    /// of those queues a transmit that ends here.
+    fn rearm(&mut self, handle: Handle<ServerConnection>) {
+        let Some(conn) = self.connections.get(handle) else { return };
+        let schedule = &mut self.schedules[ix(handle)];
+        match conn.next_timeout() {
+            Some(at) => {
+                if schedule.armed.is_none_or(|armed| at < armed) {
+                    schedule.armed = Some(at);
+                    self.timers.push(Timer { at, handle });
+                }
+            }
+            None => {
+                if !schedule.retiring {
+                    schedule.retiring = true;
+                    self.retiring.push_back(handle);
+                }
             }
         }
-        for session in expired.iter().copied() {
-            self.sessions.remove(&session);
-            self.events.push(Event::SessionExpired(session));
+    }
+    /// Removes closed connections and decides whether their session survives.
+    ///
+    /// A player who disconnected on purpose is gone. One who dropped may be
+    /// reconnecting already, so their place is held.
+    fn reap(&mut self, now: Timestamp) {
+        for _ in 0..REAP_BATCH {
+            let Some(handle) = self.retiring.pop_front() else { return };
+            self.retire(handle, now);
+        }
+    }
+
+    fn retire(&mut self, handle: Handle<ServerConnection>, now: Timestamp) {
+        self.pump_events(handle);
+
+        let Some(conn) = self.connections.get(handle) else { return };
+        let (conn_id, session, token_id) = (conn.id(), conn.session(), conn.token_id());
+
+        let schedule = &mut self.schedules[ix(handle)];
+        let reason = schedule.closed_with.unwrap_or(CloseReason::TimedOut);
+
+        self.routes.remove(&conn_id);
+        self.accepted.remove(&token_id);
+        self.connections.remove(handle);
+        self.schedules[ix(handle)] = Schedule::default();
+
+        let mut suspended = false;
+
+        // A session resumed elsewhere already points at its new connection.
+        // This one is only the husk of the old attachment and must not
+        // overwrite it.
+        if let Some(record) = self.sessions.get_mut(&session)
+            && let SessionState::Live(holder) = record.state
+            && holder == handle
+        {
+            if !matches!(reason, CloseReason::Requested | CloseReason::ServerShutdown) {
+                suspended = true;
+                record.state = SessionState::Suspended { since: now };
+                self.suspended.push_back((now, session));
+            } else {
+                self.sessions.remove(&session);
+            }
+        }
+
+        self.events.push(Event::Disconnected { session, reason, suspended });
+    }
+
+    /// Removes sessions whose grace period has lapsed, oldest first, at most a
+    /// batch per call.
+    fn expire_sessions(&mut self, now: Timestamp) {
+        let mut expired = 0;
+
+        while (expired < REAP_BATCH)
+            && let Some(&(since, session)) = self.suspended.front()
+            && (now.saturating_since(since) >= RESUME_GRACE)
+        {
+            self.suspended.pop_front();
+
+            if let Some(record) = self.sessions.get(&session)
+                && let SessionState::Suspended { since: suspended } = record.state
+                && suspended == since
+            {
+                self.sessions.remove(&session);
+                self.events.push(Event::SessionExpired(session));
+                expired += 1;
+            }
         }
     }
 
     /// Closes every connection with a notice. Keep draining transmits for a pass
     /// or two afterwards so the notices go out.
     pub fn shutdown(&mut self) {
-        for conn in self.connections.as_mut_slice() {
-            conn.close(CloseReason::ServerShutdown);
+        let handles: Vec<_> = self.handles().collect();
+        for handle in handles {
+            if let Some(conn) = self.connection_mut(handle) {
+                conn.close(CloseReason::ServerShutdown);
+            }
         }
     }
-
-    // ------------------------------------------------------------ rate limits
 
     /// Spends handshake budget, per address and globally.
     ///
@@ -557,18 +804,33 @@ impl Endpoint {
     /// attack even though none of them allocate. The per-address bucket stops
     /// one host; the global budget stops a distributed flood where every source
     /// is individually within its limit.
-    fn charge_handshake(&mut self, ctx: &mut Ctx, from: SocketAddr) -> Result<(), DropReason> {
-        if self.handshake_budget == 0 {
+    fn charge_handshake(&mut self, ctx: &mut Ctx, from: SocketAddr, kind: PacketKind) -> Result<(), DropReason> {
+        let charged = match kind {
+            PacketKind::Response => charge(&mut self.responses, &mut self.limiter, ctx.now, from),
+            _ => charge(&mut self.requests, &mut self.limiter, ctx.now, from),
+        };
+
+        if !charged {
             ctx.counters.inc(Counter::HandshakesRateLimited);
             return Err(DropReason::RateLimited);
         }
-        if !self.limiter.take(ctx.now, from) {
-            ctx.counters.inc(Counter::HandshakesRateLimited);
-            return Err(DropReason::RateLimited);
-        }
-        self.handshake_budget -= 1;
+
         Ok(())
     }
+}
+
+fn charge<P: RefillPolicy>(
+    global: &mut Bucket<P>,
+    limiter: &mut RateLimiter,
+    now: Timestamp,
+    from: SocketAddr,
+) -> bool {
+    let Some(token) = global.reserve(now) else { return false };
+    if !limiter.take(now, from) {
+        return false;
+    }
+    token.spend();
+    true
 }
 
 /// Reads the kind from a raw first byte. Handshake packets shorter than their
@@ -587,83 +849,129 @@ fn peek_kind(buf: &[u8], len: usize) -> Option<PacketKind> {
     }
 }
 
-/// Per-address token bucket in a fixed, direct-mapped table.
+/// How a token bucket fills. Up to `BURST` tokens, one per `INTERVAL`.
 ///
-/// Spraying source addresses cannot grow it, and a collision only means two
-/// addresses share a bucket, which throttles rather than blocks.
-struct RateLimiter {
-    slots: Box<[Bucket]>,
-    mask: usize,
+/// A type rather than a value, so a bucket is bound to one policy for its
+/// whole life and cannot be refilled under another.
+trait RefillPolicy {
+    const BURST: u32;
+    const INTERVAL: Duration;
 }
 
-#[derive(Clone, Copy)]
-struct Bucket {
-    key: u64,
-    tokens: u16,
+struct Bucket<P> {
+    tokens: u32,
     last_refill: Timestamp,
+    policy: PhantomData<P>,
 }
 
-impl Default for Bucket {
-    fn default() -> Self {
+impl<P> Copy for Bucket<P> {}
+impl<P> Clone for Bucket<P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: RefillPolicy> Bucket<P> {
+    fn full() -> Self {
         Self {
-            key: 0,
-            tokens: HANDSHAKE_BURST,
+            tokens: P::BURST,
             last_refill: Timestamp::ZERO,
+            policy: PhantomData,
         }
     }
+
+    /// Credits whole intervals elapsed. The partial interval is kept by
+    /// advancing `last_refill` only by what was credited, unless the bucket
+    /// filled, in which case waiting earns nothing further.
+    fn refill(&mut self, now: Timestamp) {
+        let elapsed = now.saturating_since(self.last_refill).as_nanos();
+        let intervals = elapsed / P::INTERVAL.as_nanos();
+        if intervals == 0 {
+            return;
+        }
+
+        let missing = P::BURST - self.tokens;
+        match u32::try_from(intervals) {
+            Ok(intervals) if intervals < missing => {
+                self.tokens += intervals;
+                self.last_refill = self.last_refill.saturating_add(P::INTERVAL * intervals);
+            }
+            _ => {
+                self.tokens = P::BURST;
+                self.last_refill = now;
+            }
+        }
+    }
+
+    /// Refills, then holds one token if there is one. The token is taken only
+    /// if the reservation is spent.
+    fn reserve(&mut self, now: Timestamp) -> Option<Reservation<'_, P>> {
+        self.refill(now);
+        (self.tokens > 0).then_some(Reservation { bucket: self })
+    }
+}
+
+/// One token known to be present in its bucket.
+#[must_use]
+struct Reservation<'a, P> {
+    bucket: &'a mut Bucket<P>,
+}
+
+impl<P> Reservation<'_, P> {
+    fn spend(self) {
+        // Nonzero, since the reservation exists only while a token does,
+        // and it holds the only reference to the bucket.
+        self.bucket.tokens -= 1;
+    }
+}
+
+/// Per-address token bucket in a fixed, direct-mapped table.
+///
+/// Spraying source addresses cannot grow it. Addresses whose slots collide
+/// share one bucket, which only throttles them together. The hash is
+/// keyed per process, so an attacker cannot aim a collision at a particular
+/// client
+struct RateLimiter {
+    slots: Box<[Bucket<PerAddress>]>,
+    mask: usize,
+    hasher: std::hash::RandomState,
 }
 
 impl RateLimiter {
     fn new(slots: usize) -> Self {
         let slots = slots.next_power_of_two();
         Self {
-            slots: vec![Bucket::default(); slots].into_boxed_slice(),
+            slots: vec![Bucket::full(); slots].into(),
             mask: slots - 1,
+            hasher: RandomState::new(),
         }
     }
 
     fn take(&mut self, now: Timestamp, addr: SocketAddr) -> bool {
-        let key = hash_addr(addr);
-        let slot = &mut self.slots[(key as usize) & self.mask];
-
-        if slot.key != key {
-            *slot = Bucket { key, tokens: HANDSHAKE_BURST, last_refill: now };
-        } else {
-            let elapsed = now.saturating_since(slot.last_refill);
-            let refills = (elapsed.as_nanos() / HANDSHAKE_REFILL_INTERVAL.as_nanos()) as u64;
-            if refills > 0 {
-                let gained = u16::try_from(refills).unwrap_or(u16::MAX);
-                slot.tokens = slot.tokens.saturating_add(gained).min(HANDSHAKE_BURST);
-                let steps = refills.min(u32::MAX as u64) as u32;
-                slot.last_refill = slot.last_refill.saturating_add(HANDSHAKE_REFILL_INTERVAL * steps);
+        let slot = (self.hasher.hash_one(source_key(addr)) as usize) & self.mask;
+        match self.slots[slot].reserve(now) {
+            Some(token) => {
+                token.spend();
+                true
             }
+            None => false,
         }
-
-        if slot.tokens == 0 {
-            return false;
-        }
-        slot.tokens -= 1;
-        true
     }
 }
 
-/// FNV-1a over the address and port. Adequate here: the result only picks a slot
-/// and confirms its occupant, and guards no ordered structure.
-fn hash_addr(addr: SocketAddr) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
+/// What identifies a source for rate limiting. The IP alone, since ports are
+/// free to change. An IPv6 host commonly holds a whole /64, so only that prefix
+/// counts. Limiting the full address would let one host rotate through
+/// addresses as easily as through ports.
+#[derive(Hash)]
+enum SourceKey {
+    V4(u32),
+    V6Prefix(u64),
+}
 
-    let mut hash = OFFSET;
-    let mut feed = |byte: u8| {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(PRIME);
-    };
-
+fn source_key(addr: SocketAddr) -> SourceKey {
     match addr.ip() {
-        IpAddr::V4(ip) => ip.octets().iter().for_each(|b| feed(*b)),
-        IpAddr::V6(ip) => ip.octets().iter().for_each(|b| feed(*b)),
+        IpAddr::V4(ip) => SourceKey::V4(ip.to_bits()),
+        IpAddr::V6(ip) => SourceKey::V6Prefix((ip.to_bits() >> 64) as u64),
     }
-    // Port included, so clients behind one NAT do not share a bucket.
-    addr.port().to_le_bytes().iter().for_each(|b| feed(*b));
-    hash
 }

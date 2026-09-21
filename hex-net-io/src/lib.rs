@@ -1,8 +1,8 @@
-use std::io;
-use std::net::SocketAddr;
+use std::{io, net::SocketAddr};
 
 use hex_net_core::time::Timestamp;
 
+pub mod driver;
 mod pool;
 
 /// One received datagram: where it came from, how much data, and when the
@@ -32,14 +32,14 @@ pub struct Transmit {
 /// backend that can only do one at a time implements the batch as a loop.
 pub trait Socket {
     /// Fill `buffers` with received datagrams. Returns how many were filled.
-    /// Never blocks: zero means nothing was waiting.
+    /// Never blocks, so zero means nothing was waiting.
     ///
     /// `buffers` and `out` must be the same length; `out[i]` describes what
     /// landed in `buffers[i]`.
     fn recv_batch(&mut self, buffers: &mut [&mut [u8]], out: &mut [Received]) -> io::Result<usize>;
 
-    /// Send datagrams. Returns how many left. A short count is normal when
-    /// the send buffer is full; the caller decides whether to retry or drop.
+    /// Send datagrams. Returns how many were sent. A short count is normal when
+    /// the send buffer is full. The caller decides whether to retry or drop.
     fn send_batch(&mut self, buffers: &[&[u8]], transmits: &[Transmit]) -> io::Result<usize>;
 
     /// The address this socket is bound to.

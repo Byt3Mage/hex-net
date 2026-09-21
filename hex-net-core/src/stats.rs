@@ -27,6 +27,9 @@ pub enum Counter {
     /// threshold or loss timer is too tight and bandwidth is going to
     /// needless retransmission.
     PacketsSpuriouslyLost,
+    /// Ack-eliciting packets sent, which are the ones the ledger tracks. Each
+    /// resolves exactly once, so this equals acked plus lost plus in flight.
+    PacketsTracked,
 
     ConnectionsRejectedFull,
     /// Refused by the per-address or global handshake limiter.
@@ -61,6 +64,7 @@ impl Counter {
             PacketsAcked,
             PacketsLost,
             PacketsSpuriouslyLost,
+            PacketsTracked,
             ConnectionsRejectedFull,
             HandshakesRateLimited,
             MessagesSent,
@@ -88,6 +92,7 @@ impl Counter {
             PacketsAcked => "packets_acked",
             PacketsLost => "packets_lost",
             PacketsSpuriouslyLost => "packets_spuriously_lost",
+            PacketsTracked => "packets_tracked",
             ConnectionsRejectedFull => "connections_rejected_full",
             HandshakesRateLimited => "handshakes_rate_limited",
             MessagesSent => "messages_sent",

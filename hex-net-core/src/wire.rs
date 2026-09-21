@@ -1,7 +1,9 @@
 //! Packet layout: a cleartext header, then an encrypted payload of frames.
 
-use crate::bits::{BitReader, BitWriter, ReadError, WriteError};
-use crate::seq::WireSequence;
+use crate::{
+    bits::{BitReader, BitWriter, ReadError, WriteError},
+    seq::WireSequence,
+};
 
 pub use crate::crypto::TAG_LEN;
 
@@ -19,6 +21,26 @@ pub const PROTOCOL_ID: u64 = 0x_4E45_544C_4942_0001;
 
 /// Offset of the blob inside a handshake packet: kind and length.
 pub const HANDSHAKE_BODY_OFFSET: usize = 3;
+
+/// Chosen at random by a client for each connection attempt, and carried by
+/// every request that attempt sends, retries included.
+///
+/// Both sides mix it into the connection's keys, which is what ties a
+/// connection to the handshake that created it rather than merely to the
+/// session keys, which a backend might hand out more than once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ClientNonce(pub u64);
+
+impl ClientNonce {
+    pub const LEN: usize = 8;
+
+    /// A fresh nonce from the operating system's generator.
+    pub fn random() -> ClientNonce {
+        let mut bytes = [0u8; Self::LEN];
+        getrandom::fill(&mut bytes).expect("OS randomness unavailable");
+        ClientNonce(u64::from_le_bytes(bytes))
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -73,8 +95,6 @@ mod flags {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
     pub kind: PacketKind,
-    /// Present on client-to-server packets only: the server routes by id, while
-    /// the client identifies the server by address.
     pub conn_id: ConnectionId,
     pub sequence: WireSequence,
     /// Newest sequence received from the peer.
@@ -186,6 +206,28 @@ pub fn encode_handshake(kind: PacketKind, blob: &[u8], out: &mut [u8]) -> Result
 pub fn handshake_blob(packet: &[u8]) -> Option<&[u8]> {
     let len = u16::from_le_bytes(packet.get(1..3)?.try_into().ok()?) as usize;
     packet.get(HANDSHAKE_BODY_OFFSET..HANDSHAKE_BODY_OFFSET + len)
+}
+
+/// Frames a request (ticket, the attempt's nonce, padding).
+///
+/// The nonce rides in the clear. Tampering with it only makes the keys the
+/// two sides derive disagree, so the handshake fails. It cannot make either
+/// side accept a connection it did not ask for.
+pub fn encode_request(ticket: &[u8], nonce: ClientNonce, out: &mut [u8]) -> Result<usize, WriteError> {
+    let at = HANDSHAKE_BODY_OFFSET + ticket.len();
+    if (at + ClientNonce::LEN) > HANDSHAKE_LEN {
+        return Err(WriteError::Overflow);
+    }
+    let len = encode_handshake(PacketKind::Request, ticket, out)?;
+    out[at..(at + ClientNonce::LEN)].copy_from_slice(&nonce.0.to_le_bytes());
+    Ok(len)
+}
+
+/// The nonce a request carries after its ticket.
+pub fn request_nonce(packet: &[u8]) -> Option<ClientNonce> {
+    let at = HANDSHAKE_BODY_OFFSET + handshake_blob(packet)?.len();
+    let bytes = packet.get(at..(at + ClientNonce::LEN))?;
+    Some(ClientNonce(u64::from_le_bytes(bytes.try_into().ok()?)))
 }
 
 #[inline]

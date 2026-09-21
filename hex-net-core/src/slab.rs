@@ -1,38 +1,35 @@
 //! Storage with stable handles and contiguous items.
 
-use core::fmt;
-use core::hash::{Hash, Hasher};
-use core::marker::PhantomData;
+use core::{
+    fmt,
+    hash::{Hash, Hasher},
+    marker::PhantomData,
+};
 
 const NONE: u32 = u32::MAX;
 
 /// A reference into a `Slab<T>` that keeps working as items move and stops
 /// working once its item is removed.
-///
-/// The generation prevents a handle to a departed item from reaching whatever
-/// later occupies its slot.
 pub struct Handle<T> {
     index: u32,
     generation: u32,
-    /// `fn() -> T` rather than `T`: the handle owns no T, and this form adds
-    /// no auto-trait or drop-check obligations.
-    _marker: PhantomData<fn() -> T>,
+    marker: PhantomData<fn() -> T>,
 }
 
 impl<T> Handle<T> {
     #[inline]
     const fn new(index: u32, generation: u32) -> Self {
-        Self { index, generation, _marker: PhantomData }
+        Self { index, generation, marker: PhantomData }
     }
 
     /// Slot number, for logs and metrics. Not unique over time.
     #[inline]
-    pub fn index(&self) -> u32 {
+    pub const fn index(&self) -> u32 {
         self.index
     }
 
     #[inline]
-    pub fn generation(&self) -> u32 {
+    pub const fn generation(&self) -> u32 {
         self.generation
     }
 }

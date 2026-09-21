@@ -4,14 +4,18 @@
 //! receives at the address it claims, and every handshake packet is padded so a
 //! reply is never larger than the request.
 
-use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
-use crate::bits::{BitReader, BitWriter, ReadError, WriteError};
-use crate::crypto::{self, Key, Keys, MAX_BLOB};
-use crate::fixed::FixedVec;
-use crate::time::Timestamp;
-use crate::wire::{HANDSHAKE_LEN, PROTOCOL_ID, handshake_blob};
+use crate::{
+    bits::{BitReader, BitWriter, ReadError, WriteError},
+    crypto::{self, Key, Keys, MAX_BLOB},
+    fixed::FixedVec,
+    time::Timestamp,
+    wire::{ClientNonce, HANDSHAKE_LEN, PROTOCOL_ID, handshake_blob},
+};
 
 /// How long a client has to return a cookie.
 pub const COOKIE_LIFETIME: Duration = Duration::from_secs(10);
@@ -27,14 +31,14 @@ pub const MAX_USER_DATA: usize = 256;
 
 /// Worst-case plaintext sizes.
 pub const MAX_TICKET: usize = 128 + MAX_USER_DATA;
-pub const MAX_COOKIE: usize = MAX_TICKET + 32;
+pub const MAX_COOKIE: usize = MAX_TICKET + 40;
 
 const _: () = {
     // A change to MAX_USER_DATA fails the build rather than truncating a ticket
     // at runtime. The ticket's fixed part is 98 bytes. A cookie prefixes at
     // most 27 for an IPv6 address with its family tag and port.
-    assert!(MAX_TICKET >= (98 + MAX_USER_DATA));
-    assert!(MAX_COOKIE >= (MAX_TICKET + 27));
+    assert!(MAX_TICKET >= (MAX_USER_DATA + 98));
+    assert!(MAX_COOKIE >= (MAX_TICKET + 27 + ClientNonce::LEN));
     assert!(MAX_BLOB >= (MAX_COOKIE + 28));
 };
 
@@ -72,6 +76,9 @@ pub struct Cookie {
     /// The address the cookie was issued to. A response from anywhere else is
     /// rejected, which is what proves the client receives where it claims.
     pub addr: SocketAddr,
+    /// The nonce the client's request carried. Sealed here, so the server
+    /// derives the connection's keys from what the client actually sent.
+    pub nonce: ClientNonce,
     pub ticket: Ticket,
 }
 
@@ -128,11 +135,12 @@ impl Acceptor {
         &self,
         now: Timestamp,
         addr: SocketAddr,
+        nonce: ClientNonce,
         ticket: &Ticket,
         out: &mut [u8],
     ) -> Result<usize, HandshakeError> {
         let mut plain = [0u8; MAX_COOKIE];
-        let len = encode_cookie(now, addr, ticket, &mut plain).map_err(|_| HandshakeError::Malformed)?;
+        let len = encode_cookie(now, addr, nonce, ticket, &mut plain).map_err(|_| HandshakeError::Malformed)?;
         let aad = PROTOCOL_ID.to_le_bytes();
         crypto::encrypt_blob(&self.server_key, &plain[..len], &aad, out).map_err(|_| HandshakeError::Malformed)
     }
@@ -221,10 +229,11 @@ fn decode_ticket(bytes: &[u8]) -> Result<Ticket, HandshakeError> {
     read(bytes).map_err(|_| HandshakeError::Malformed)
 }
 
-/// Layout: `[issued_at | address family | address | port | ticket]`
+/// Layout: `[issued_at | address family | address | port | nonce | ticket]`
 fn encode_cookie(
     now: Timestamp,
     addr: SocketAddr,
+    nonce: ClientNonce,
     ticket: &Ticket,
     out: &mut [u8; MAX_COOKIE],
 ) -> Result<usize, WriteError> {
@@ -246,6 +255,9 @@ fn encode_cookie(
     out[at..at + 2].copy_from_slice(&addr.port().to_le_bytes());
     at += 2;
 
+    out[at..at + ClientNonce::LEN].copy_from_slice(&nonce.0.to_le_bytes());
+    at += ClientNonce::LEN;
+
     let plain = out[at..at + MAX_TICKET].as_mut_array().ok_or(WriteError::OutOfRange)?;
     at += encode_ticket(ticket, plain)?;
 
@@ -256,7 +268,7 @@ fn decode_cookie(bytes: &[u8]) -> Result<Cookie, HandshakeError> {
     let slice = |range| bytes.get(range).ok_or(HandshakeError::Malformed);
     let issued = u64::from_le_bytes(slice(0..8)?.try_into().expect("checked length"));
 
-    let (ip, at) = match *bytes.get(8).ok_or(HandshakeError::Malformed)? {
+    let (ip, mut at) = match *bytes.get(8).ok_or(HandshakeError::Malformed)? {
         4 => {
             let octets: [u8; 4] = slice(9..13)?.try_into().expect("checked length");
             (IpAddr::from(octets), 13)
@@ -269,11 +281,17 @@ fn decode_cookie(bytes: &[u8]) -> Result<Cookie, HandshakeError> {
     };
 
     let port = u16::from_le_bytes(slice(at..at + 2)?.try_into().expect("checked length"));
-    let ticket = decode_ticket(slice(at + 2..bytes.len())?)?;
+    at += 2;
+
+    let nonce = u64::from_le_bytes(slice(at..at + ClientNonce::LEN)?.try_into().expect("checked length"));
+    at += ClientNonce::LEN;
+
+    let ticket = decode_ticket(slice(at..bytes.len())?)?;
 
     Ok(Cookie {
         issued_at: Timestamp::from_nanos(issued),
         addr: SocketAddr::new(ip, port),
+        nonce: ClientNonce(nonce),
         ticket,
     })
 }

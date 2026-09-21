@@ -4,9 +4,12 @@
 //! repeated, the header is authenticated as associated data, and a failed
 //! open invalidates the whole packet.
 
-use chacha20poly1305::aead::inout::InOutBuf;
-use chacha20poly1305::aead::{AeadInOut, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce, Tag};
+use chacha20poly1305::{
+    ChaCha20Poly1305, Nonce, Tag,
+    aead::{AeadInOut, KeyInit, inout::InOutBuf},
+};
+
+use crate::wire::{ClientNonce, ConnectionId};
 
 pub const TAG_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
@@ -16,14 +19,67 @@ pub const MAX_BLOB: usize = 512;
 
 pub type Key = [u8; 32];
 
-/// Both directions' keys for one session.
+/// Both directions' keys for one session, as the backend issued them.
 ///
-/// Fixed for the session's life, including across resumes. The connection id
-/// forms half of every nonce, so a new id gives a disjoint nonce space.
+/// Never used to encrypt a packet. Each connection derives its own pair with
+/// `for_connection`, so what the backend hands out only has to be secret,
+/// rather than unique.
 #[derive(Debug, Clone, Copy)]
 pub struct Keys {
     pub client_to_server: Key,
     pub server_to_client: Key,
+}
+
+impl Keys {
+    /// The keys one connection encrypts with, bound to its id and to the
+    /// nonce of the handshake that created it.
+    ///
+    /// Two connections therefore never share keys, even when a backend issues
+    /// the same session keys twice or a restarted server hands out an id
+    /// again. A packet from any other connection fails authentication rather
+    /// than being taken for this one's, and no two connections can ever share
+    /// a nonce space.
+    pub fn for_connection(&self, id: ConnectionId, nonce: ClientNonce) -> ConnectionKeys {
+        ConnectionKeys(Keys {
+            client_to_server: derive(&self.client_to_server, id, nonce),
+            server_to_client: derive(&self.server_to_client, id, nonce),
+        })
+    }
+}
+
+/// Keys bound to one connection. Only `Keys::for_connection` makes one, so a
+/// connection cannot be built from session keys directly.
+#[derive(Clone, Copy)]
+pub struct ConnectionKeys(Keys);
+
+impl ConnectionKeys {
+    #[inline]
+    pub fn client_to_server(&self) -> &Key {
+        &self.0.client_to_server
+    }
+
+    #[inline]
+    pub fn server_to_client(&self) -> &Key {
+        &self.0.server_to_client
+    }
+}
+
+/// A subkey: the ChaCha20 keystream under `key` at the nonce `id || nonce`,
+/// which is a pseudorandom function of that nonce.
+///
+/// Session keys encrypt nothing else, so this nonce space is never shared
+/// with packet encryption, which uses the derived keys.
+fn derive(key: &Key, id: ConnectionId, nonce: ClientNonce) -> Key {
+    let mut iv = [0u8; NONCE_LEN];
+    iv[0..4].copy_from_slice(&id.0.to_le_bytes());
+    iv[4..12].copy_from_slice(&nonce.0.to_le_bytes());
+
+    // Encrypting zeros yields the keystream itself. The tag is not needed.
+    let mut subkey: Key = [0u8; 32];
+    let _ = ChaCha20Poly1305::new(key.into())
+        .encrypt_inout_detached(&iv.into(), &[], InOutBuf::from(&mut subkey[..]))
+        .expect("32 bytes is far below the cipher's message limit");
+    subkey
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

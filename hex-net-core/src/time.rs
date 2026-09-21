@@ -3,7 +3,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::seq::{self, Sequence, WireSequence};
+use crate::seq::{self, WireSequence};
 
 /// Nanoseconds since an arbitrary origin, always monotonic.
 ///
@@ -151,8 +151,8 @@ impl Tick {
     /// using the same nearest-candidate rule as packet sequences.
     #[inline]
     pub fn from_wire(reference: Tick, wire: WireSequence) -> Option<Tick> {
-        let full = seq::reconstruct(Sequence::from_raw(reference.0 as u64), wire)?;
-        u32::try_from(full.get()).ok().map(Tick)
+        let full = seq::reconstruct(reference.0 as u64, wire)?;
+        u32::try_from(full).ok().map(Tick)
     }
 }
 

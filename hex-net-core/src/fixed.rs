@@ -138,7 +138,7 @@ impl<T: Copy, const N: usize> DerefMut for FixedVec<T, N> {
 /// Fixed-capacity FIFO that drops its oldest entry when full, so an
 /// application that stops draining events cannot make a connection grow.
 #[derive(Clone, Copy)]
-pub struct RingQueue<T: Copy + Default, const N: usize> {
+pub struct RingQueue<T: Copy, const N: usize> {
     items: [T; N],
     head: usize,
     len: usize,

@@ -7,19 +7,21 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::ack::{Delivery, Rtt, decode_ack_delay, encode_ack_delay};
-use crate::bits::{BitReader, BitWriter, ReadError};
-use crate::budget::{Budget, BudgetConfig};
-use crate::channel::{ChannelSet, Channels, OnMessage, PacketMessages, SendError};
-use crate::crypto::{Key, Keys, MAX_BLOB};
-use crate::ctx::Ctx;
-use crate::fixed::RingQueue;
-use crate::handshake::{EncryptedTicket, SessionId};
-use crate::packet::{DecryptError, Packet, PacketCrypto};
-use crate::seq::{Sequence, WindowError};
-use crate::stats::Counter;
-use crate::time::Timestamp;
-use crate::wire::{ConnectionId, ControlKind, FrameKind, Header, PacketKind, TAG_LEN};
+use crate::{
+    ack::{Delivery, MAX_ACK_DELAY, Outgoing, Resolved, Rtt, decode_ack_delay, encode_ack_delay},
+    bits::{BitReader, BitWriter, ReadError},
+    budget::{Budget, BudgetConfig},
+    channel::{ChannelSet, Channels, OnMessage, PacketMessages, PacketRecord, SendError},
+    crypto::{ConnectionKeys, Key, MAX_BLOB},
+    ctx::Ctx,
+    fixed::RingQueue,
+    handshake::{EncryptedTicket, SessionId},
+    packet::{DecryptError, Packet, PacketCrypto},
+    seq::{Sequence, WindowError},
+    stats::{Counter, Counters},
+    time::Timestamp,
+    wire::{ConnectionId, ControlKind, FrameKind, Header, PacketKind, TAG_LEN},
+};
 
 /// No packet received for this long and the connection is dead.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -28,11 +30,13 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// liveness signal.
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Longest an acknowledgement may wait for a packet to ride on.
-pub const MAX_ACK_DELAY: Duration = Duration::from_millis(25);
-
 /// A close notice is unreliable, so it goes out more than once.
 const CLOSE_SENDS: u8 = 3;
+
+/// Unacknowledged messages a probe packet carries again. Kept small, so an
+/// acknowledgement that was merely late makes these duplicates, which the
+/// receiver discards but the link still carried.
+const PROBE_MESSAGES: usize = 2;
 
 /// How long an unproven path is probed before it is abandoned.
 const PATH_TIMEOUT: Duration = Duration::from_secs(3);
@@ -46,6 +50,8 @@ pub enum CloseReason {
     /// An authenticated peer sent something the protocol does not allow.
     ProtocolViolation = 2,
     ServerShutdown = 3,
+    /// The session was resumed on another connection, which now owns it.
+    Replaced = 4,
 }
 
 impl CloseReason {
@@ -57,6 +63,7 @@ impl CloseReason {
             1 => Some(CloseReason::TimedOut),
             2 => Some(CloseReason::ProtocolViolation),
             3 => Some(CloseReason::ServerShutdown),
+            4 => Some(CloseReason::Replaced),
             _ => None,
         }
     }
@@ -110,14 +117,19 @@ mod sealed {
 /// Which side of a connection this is.
 pub trait Role: Sized + sealed::Sealed {
     /// Splits a session's keys into this side's transmit and receive pair.
-    fn split_keys(keys: &Keys) -> (Key, Key);
+    fn split_keys(keys: &ConnectionKeys) -> (Key, Key);
 
     /// Handles a control frame other than Ping or Close, which are symmetric
     /// and handled in shared code.
     ///
     /// A frame only the opposite side sends is a protocol violation: an
     /// authenticated peer producing one is broken or hostile.
-    fn read_control(conn: &mut Connection<Self>, kind: ControlKind, r: &mut BitReader) -> Result<(), ReadError>;
+    fn read_control(
+        conn: &mut Connection<Self>,
+        now: Timestamp,
+        kind: ControlKind,
+        r: &mut BitReader,
+    ) -> Result<(), ReadError>;
 
     /// Writes this side's control frames. Returns whether anything was written.
     fn write_control(conn: &mut Connection<Self>, w: &mut BitWriter) -> bool;
@@ -174,16 +186,20 @@ pub struct Connection<R: Role> {
     ticket: Option<EncryptedTicket>,
 
     crypto: PacketCrypto,
-    delivery: Delivery<128>,
+    delivery: Delivery<PacketRecord>,
     budget: Budget,
     channels: Channels,
 
-    /// When a packet needing acknowledgement arrived, so the delay can be
-    /// reported and subtracted from the peer's RTT sample.
+    /// When the first packet still awaiting acknowledgement arrived, which is
+    /// what `MAX_ACK_DELAY` is measured from.
     ack_pending: Option<Timestamp>,
 
     last_received: Timestamp,
-    pending_ping: bool,
+
+    /// Ack-eliciting packets owed, such as a keepalive, or the probes the delivery
+    /// ledger asked for. One per packet, since each must be separately
+    /// losable to be worth sending.
+    pending_probes: u8,
 
     events: RingQueue<Event, 16>,
     role: R,
@@ -194,7 +210,7 @@ impl<R: Role> Connection<R> {
         now: Timestamp,
         id: ConnectionId,
         addr: SocketAddr,
-        keys: &Keys,
+        keys: &ConnectionKeys,
         channels: ChannelSet,
         budget: BudgetConfig,
         role: R,
@@ -206,15 +222,13 @@ impl<R: Role> Connection<R> {
             addr,
             lifecycle: Lifecycle::Open,
             ticket: None,
-            // The connection id forms half of every nonce, so a resumed session
-            // may reuse its keys under a newly assigned id.
             crypto: PacketCrypto::new(id, &tx, &rx),
             delivery: Delivery::new(now),
             budget: Budget::new(now, budget),
             channels: Channels::new(channels),
             ack_pending: None,
             last_received: now,
-            pending_ping: false,
+            pending_probes: 0,
             events: RingQueue::new(),
             role,
         }
@@ -307,7 +321,7 @@ impl<R: Role> Connection<R> {
         self.handle_ack(ctx, &opened.header);
 
         let body = &buf[opened.body];
-        let eliciting = match self.read_frames(body, on_message) {
+        let eliciting = match self.read_frames(ctx.now, body, on_message) {
             Ok(eliciting) => eliciting,
             Err(_) => {
                 ctx.counters.inc(Counter::PacketsMalformed);
@@ -320,7 +334,7 @@ impl<R: Role> Connection<R> {
         };
 
         if eliciting {
-            self.crypto.record_eliciting(opened.sequence);
+            self.crypto.record_eliciting(opened.sequence, ctx.now);
             if self.ack_pending.is_none() {
                 self.ack_pending = Some(ctx.now);
             }
@@ -335,19 +349,13 @@ impl<R: Role> Connection<R> {
     fn handle_ack(&mut self, ctx: &mut Ctx, header: &Header) {
         let Some(wire_ack) = header.ack else { return };
         let Some(ack) = self.crypto.resolve_ack(wire_ack) else { return };
-
-        let mut acked = 0u64;
         self.delivery.on_ack(
             ctx.now,
             ack,
             decode_ack_delay(header.ack_delay),
             header.ack_bits,
-            |event| {
-                acked += event.confirmed as u64;
-                self.channels.on_delivery(event);
-            },
+            |resolved| apply_resolution(&mut self.channels, &mut self.budget, ctx.counters, resolved),
         );
-        ctx.counters.add(Counter::PacketsAcked, acked);
     }
 
     /// Reads frames until padding or the end of the payload.
@@ -355,13 +363,13 @@ impl<R: Role> Connection<R> {
     /// Returns whether the packet carried anything worth acknowledging: a packet
     /// of nothing but acknowledgements must not itself be acknowledged, or the
     /// two sides would acknowledge each other forever.
-    fn read_frames(&mut self, body: &[u8], on_message: OnMessage) -> Result<bool, ReadError> {
+    fn read_frames(&mut self, now: Timestamp, body: &[u8], on_message: OnMessage) -> Result<bool, ReadError> {
         let mut r = BitReader::new(body);
         let mut eliciting = false;
         while r.bits_remaining() >= (FrameKind::BITS as usize) {
             match FrameKind::read(&mut r)? {
                 FrameKind::Padding => break,
-                FrameKind::Control => self.read_control(&mut r)?,
+                FrameKind::Control => self.read_control(now, &mut r)?,
                 FrameKind::Message => self.channels.read_message(&mut r, on_message)?,
                 _ => return Err(ReadError::OutOfRange),
             }
@@ -371,7 +379,7 @@ impl<R: Role> Connection<R> {
     }
 
     /// Ping and Close are symmetric; everything else is role-specific.
-    fn read_control(&mut self, r: &mut BitReader) -> Result<(), ReadError> {
+    fn read_control(&mut self, now: Timestamp, r: &mut BitReader) -> Result<(), ReadError> {
         match ControlKind::read(r)? {
             ControlKind::Ping => Ok(()),
             ControlKind::Close => {
@@ -380,7 +388,7 @@ impl<R: Role> Connection<R> {
                 self.events.push(Event::Closed(reason));
                 Ok(())
             }
-            other => R::read_control(self, other, r),
+            other => R::read_control(self, now, other, r),
         }
     }
 
@@ -396,6 +404,12 @@ impl<R: Role> Connection<R> {
 
         self.budget.assess(ctx.now, self.delivery.rtt());
         let allowance = self.budget.available(ctx.now) as usize;
+
+        // A probe has to go out regardless, so it carries the messages whose
+        // acknowledgement it is waiting for.
+        if self.pending_probes > 0 {
+            self.channels.requeue_oldest(PROBE_MESSAGES);
+        }
 
         let ticket = self.crypto.next_sequence();
         let sequence = ticket.sequence();
@@ -431,16 +445,24 @@ impl<R: Role> Connection<R> {
         let _ = FrameKind::Padding.write(&mut w);
         let body_end = header_len + w.finish();
 
-        let Ok(len) = self.crypto.encrypt(ticket, out, header_len, body_end) else {
+        let Ok(sealed) = self.crypto.encrypt(ticket, out, header_len, body_end) else {
             self.channels.on_packet_aborted(staged);
             return None;
         };
 
-        self.channels.on_packet_sent(sequence, staged);
+        let record = self.channels.on_packet_sent(staged);
+        let outgoing = if eliciting { Outgoing::Eliciting(record) } else { Outgoing::AckOnly };
 
-        self.delivery.on_sent(ctx.now, sequence, len, eliciting);
-        self.budget.on_sent(len);
+        self.delivery.on_sent(ctx.now, sealed.sequence(), outgoing, |resolved| {
+            apply_resolution(&mut self.channels, &mut self.budget, ctx.counters, resolved)
+        });
+        self.budget.on_sent(sealed.datagram_len(), eliciting);
         self.ack_pending = None;
+
+        if eliciting {
+            ctx.counters.inc(Counter::PacketsTracked);
+        }
+        let len = usize::from(sealed.datagram_len());
         ctx.counters.inc(Counter::DatagramsSent);
         ctx.counters.add(Counter::BytesSent, len as u64);
 
@@ -457,15 +479,13 @@ impl<R: Role> Connection<R> {
     }
 
     fn build_header(&self, now: Timestamp, sequence: Sequence) -> Header {
-        let newest = self.crypto.newest_acknowledged();
-
-        let (ack, ack_delay) = match self.ack_pending {
-            Some(since) => (Some(newest.to_wire()), encode_ack_delay(now.saturating_since(since))),
-            // Repeating the newest sequence costs three bytes and gives the peer
-            // another chance to learn about packets whose earlier
-            // acknowledgements were lost.
-            None if !newest.is_none() => (Some(newest.to_wire()), 0),
-            None => (None, 0),
+        let (ack, ack_delay, ack_bits) = match self.crypto.ack_state() {
+            Some(state) => (
+                Some(state.newest.to_wire()),
+                encode_ack_delay(now.saturating_since(state.received_at)),
+                state.bits,
+            ),
+            None => (None, 0, 0),
         };
 
         Header {
@@ -474,7 +494,7 @@ impl<R: Role> Connection<R> {
             sequence: sequence.to_wire(),
             ack,
             ack_delay,
-            ack_bits: if ack.is_some() { self.crypto.ack_bits() } else { 0 },
+            ack_bits,
         }
     }
 
@@ -501,18 +521,35 @@ impl<R: Role> Connection<R> {
         ok
     }
 
+    /// Writes the frame that makes a probe or keepalive ack-eliciting.
+    ///
+    /// Written even when the packet also carries requeued messages. A ping
+    /// costs a few bits and guarantees the packet elicits an acknowledgement
+    /// whatever the budget allows the channels to add.
     fn write_ping(&mut self, w: &mut BitWriter) -> bool {
-        if !self.pending_ping {
+        if self.pending_probes == 0 {
             return false;
         }
         let at = w.checkpoint();
         let ok = FrameKind::Control.write(w).is_ok() && ControlKind::Ping.write(w).is_ok();
         if ok {
-            self.pending_ping = false;
+            self.pending_probes -= 1;
         } else {
             w.rollback(at);
         }
         ok
+    }
+
+    /// Tracked packets whose outcome is still unknown.
+    #[inline]
+    pub fn packets_in_flight(&self) -> u32 {
+        self.delivery.in_flight()
+    }
+
+    /// Messages queued to send or awaiting acknowledgement.
+    #[inline]
+    pub fn pending_messages(&self) -> usize {
+        self.channels.pending_len()
     }
 
     /// Runs loss detection, keepalives, the idle timeout, and the role's own
@@ -528,35 +565,51 @@ impl<R: Role> Connection<R> {
             return;
         }
 
-        let mut lost = 0u64;
-        self.delivery.detect_lost(ctx.now, |event| {
-            lost += 1;
-            self.budget.on_lost();
-            self.channels.on_delivery(event);
+        let probe = self.delivery.on_timeout(ctx.now, |resolved| {
+            apply_resolution(&mut self.channels, &mut self.budget, ctx.counters, resolved)
         });
-        ctx.counters.add(Counter::PacketsLost, lost);
+
+        if let Some(probe) = probe {
+            self.pending_probes = self.pending_probes.max(probe.packets);
+        }
 
         if ctx.now.saturating_since(self.delivery.last_eliciting()) >= KEEPALIVE_INTERVAL {
-            self.pending_ping = true;
+            self.pending_probes = self.pending_probes.max(1);
         }
 
         R::on_timeout(self, ctx.now);
     }
 
-    /// The earliest time this connection next needs servicing.
+    /// The earliest time this connection next needs servicing, e.g, a timer, or
+    /// queued data the budget has come to allow. The driver runs `handle_timeout`
+    /// and then transmits. Waking for the budget needs only the transmit.
     pub fn next_timeout(&self) -> Option<Timestamp> {
         if self.lifecycle == Lifecycle::Closed {
             return None;
         }
 
+        // Probes still owed are due at once, and each needs its own packet.
+        if self.pending_probes > 0 {
+            return Some(Timestamp::ZERO);
+        }
+
         let mut earliest = self.last_received.saturating_add(IDLE_TIMEOUT);
 
-        if let Some(at) = self.delivery.next_loss_time() {
+        if let Some(at) = self.delivery.next_timeout() {
             earliest = earliest.min(at);
         }
         if let Some(since) = self.ack_pending {
             earliest = earliest.min(since.saturating_add(MAX_ACK_DELAY));
         }
+
+        // Queued data waiting on the budget. Only an open connection writes
+        // channel frames, so it can be worken to send them.
+        if (self.lifecycle == Lifecycle::Open)
+            && let Some(len) = self.channels.next_unsent_len()
+        {
+            earliest = earliest.min(self.budget.ready_for(len))
+        }
+
         if let Some(at) = R::next_deadline(self) {
             earliest = earliest.min(at);
         }
@@ -566,14 +619,18 @@ impl<R: Role> Connection<R> {
     }
 }
 
-// ----------------------------------------------------------------- client
-
 impl Role for Client {
-    fn split_keys(keys: &Keys) -> (Key, Key) {
-        (keys.client_to_server, keys.server_to_client)
+    fn split_keys(keys: &ConnectionKeys) -> (Key, Key) {
+        (*keys.client_to_server(), *keys.server_to_client())
     }
 
-    fn read_control(conn: &mut Connection<Self>, kind: ControlKind, r: &mut BitReader) -> Result<(), ReadError> {
+    fn read_control(
+        conn: &mut Connection<Self>,
+        now: Timestamp,
+        kind: ControlKind,
+        r: &mut BitReader,
+    ) -> Result<(), ReadError> {
+        let _ = now;
         match kind {
             ControlKind::PathChallenge => {
                 conn.role.pending_path_response = Some(r.read_u64()?);
@@ -633,7 +690,7 @@ impl Connection<Client> {
         now: Timestamp,
         id: ConnectionId,
         addr: SocketAddr,
-        keys: &Keys,
+        keys: &ConnectionKeys,
         channels: ChannelSet,
         budget: BudgetConfig,
     ) -> Self {
@@ -663,11 +720,16 @@ impl Connection<Client> {
 }
 
 impl Role for Server {
-    fn split_keys(keys: &Keys) -> (Key, Key) {
-        (keys.server_to_client, keys.client_to_server)
+    fn split_keys(keys: &ConnectionKeys) -> (Key, Key) {
+        (*keys.server_to_client(), *keys.client_to_server())
     }
 
-    fn read_control(conn: &mut Connection<Self>, kind: ControlKind, r: &mut BitReader) -> Result<(), ReadError> {
+    fn read_control(
+        conn: &mut Connection<Self>,
+        now: Timestamp,
+        kind: ControlKind,
+        r: &mut BitReader,
+    ) -> Result<(), ReadError> {
         match kind {
             ControlKind::PathResponse => {
                 let token = r.read_u64()?;
@@ -677,6 +739,9 @@ impl Role for Server {
                 if pending.token == token {
                     conn.role.probe = None;
                     conn.addr = pending.addr;
+                    // Timing and rate described the old route.
+                    conn.delivery.on_path_change();
+                    conn.budget.on_path_change(now);
                     conn.events.push(Event::Migrated(pending.addr));
                 }
                 Ok(())
@@ -763,7 +828,7 @@ impl Connection<Server> {
         session: SessionId,
         token_id: u64,
         addr: SocketAddr,
-        keys: &Keys,
+        keys: &ConnectionKeys,
         channels: ChannelSet,
         budget: BudgetConfig,
     ) -> Self {
@@ -827,4 +892,27 @@ fn write_control_u64(w: &mut BitWriter, kind: ControlKind, value: u64) -> bool {
         w.rollback(at);
     }
     ok
+}
+
+fn apply_resolution(
+    channels: &mut Channels,
+    budget: &mut Budget,
+    counters: &mut Counters,
+    resolved: Resolved<PacketRecord>,
+) {
+    match resolved {
+        Resolved::Acked(record) => {
+            counters.inc(Counter::PacketsAcked);
+            channels.on_acked(record);
+        }
+        Resolved::Lost(record) => {
+            counters.inc(Counter::PacketsLost);
+            budget.on_lost();
+            channels.on_lost(record);
+        }
+        Resolved::Spurious => {
+            counters.inc(Counter::PacketsSpuriouslyLost);
+            budget.on_spurious();
+        }
+    }
 }

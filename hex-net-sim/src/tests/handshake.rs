@@ -8,7 +8,7 @@ use hex_net_core::{
     handshake::{Acceptor, HandshakeError, MAX_USER_DATA, RESUME_GRACE, SessionId, Ticket, UserData, encrypt_ticket},
     packet::Packet,
     time::Timestamp,
-    wire::{HANDSHAKE_LEN, MAX_DATAGRAM, PacketKind, encode_handshake},
+    wire::{ClientNonce, HANDSHAKE_LEN, MAX_DATAGRAM, PacketKind, encode_handshake},
 };
 
 use crate::pair::{Pair, session_keys};
@@ -166,7 +166,7 @@ fn a_cookie_binds_the_address_that_presented_the_ticket() {
 
         let mut encrypted = [0u8; MAX_BLOB];
         let len = acceptor
-            .encrypt_cookie(now, addr, &ticket, &mut encrypted)
+            .encrypt_cookie(now, addr, ClientNonce(0x5EED), &ticket, &mut encrypted)
             .expect("encrypt");
 
         let mut packet: Packet = [0u8; MAX_DATAGRAM];
@@ -175,6 +175,7 @@ fn a_cookie_binds_the_address_that_presented_the_ticket() {
         let cookie = acceptor.decrypt_cookie(&packet[..HANDSHAKE_LEN]).expect("decrypt");
 
         assert_eq!(cookie.addr, addr, "{text}");
+        assert_eq!(cookie.nonce, ClientNonce(0x5EED), "{text}");
         assert_eq!(cookie.issued_at, now);
         assert_eq!(cookie.ticket.token_id, ticket.token_id);
         assert_eq!(cookie.ticket.session, ticket.session);
@@ -208,7 +209,7 @@ fn a_cookie_carries_a_full_user_data_payload() {
     let addr = "[2001:db8::1]:65535".parse().expect("literal address");
     let mut encrypted = [0u8; MAX_BLOB];
     let len = acceptor
-        .encrypt_cookie(now, addr, &ticket, &mut encrypted)
+        .encrypt_cookie(now, addr, ClientNonce(0x5EED), &ticket, &mut encrypted)
         .expect("a full ticket fits a cookie");
 
     let mut packet: Packet = [0u8; MAX_DATAGRAM];
@@ -239,7 +240,7 @@ fn a_cookie_from_another_server_is_rejected() {
     let addr = "10.0.0.2:40000".parse().expect("literal address");
     let mut encrypted = [0u8; MAX_BLOB];
     let len = issuer
-        .encrypt_cookie(now, addr, &ticket, &mut encrypted)
+        .encrypt_cookie(now, addr, ClientNonce(0x5EED), &ticket, &mut encrypted)
         .expect("encrypt");
 
     let mut packet: Packet = [0u8; MAX_DATAGRAM];

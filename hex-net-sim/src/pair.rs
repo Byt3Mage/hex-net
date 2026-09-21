@@ -1,9 +1,9 @@
 //! One client, one server, and a wire between them.
 //!
-//! No loss, no latency, no scheduling: a datagram that is sent is on the wire,
-//! and a datagram that is delivered is gone. The point is to watch the two
-//! sides talk and assert on every packet that crosses, before anything is
-//! simulated.
+//! No loss and no reordering. The wire has a fixed one-way latency, zero by
+//! default: a datagram arrives that long after it is sent, and one that has
+//! arrived is gone. The point is to watch the two sides talk and assert on
+//! every packet that crosses.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -29,11 +29,16 @@ use hex_net_core::{
 /// fails rather than hanging.
 const SETTLE_LIMIT: usize = 64;
 
+/// Passes `run_for` will run before giving up so a time that stays due
+/// without ever being serviced fails the run rather than spinning.
+const RUN_LIMIT: usize = 100_000;
+
 /// A datagram as it crossed the wire, kept for inspection.
 pub struct Datagram {
     pub from: SocketAddr,
     pub to: SocketAddr,
     pub len: usize,
+    pub arrives_at: Timestamp,
     data: Packet,
 }
 
@@ -69,6 +74,7 @@ struct Outbox<'a> {
     queue: &'a mut VecDeque<Datagram>,
     trace: &'a mut Vec<Datagram>,
     from: SocketAddr,
+    arrives_at: Timestamp,
     slot: Box<Packet>,
 }
 
@@ -78,28 +84,44 @@ impl PacketSink for Outbox<'_> {
     }
 
     fn commit(&mut self, to: Destinations, len: usize) {
-        push(self.queue, self.trace, self.from, to.primary, &self.slot[..len]);
+        let bytes = &self.slot[..len];
+        push(self.queue, self.trace, self.from, to.primary, self.arrives_at, bytes);
 
         // While a path is being validated the same packet goes to both the old
         // address and the one under test.
         if let Some(probe) = to.probe {
-            push(self.queue, self.trace, self.from, probe, &self.slot[..len]);
+            push(self.queue, self.trace, self.from, probe, self.arrives_at, bytes);
         }
     }
 }
 
-fn push(queue: &mut VecDeque<Datagram>, trace: &mut Vec<Datagram>, from: SocketAddr, to: SocketAddr, bytes: &[u8]) {
+fn push(
+    queue: &mut VecDeque<Datagram>,
+    trace: &mut Vec<Datagram>,
+    from: SocketAddr,
+    to: SocketAddr,
+    arrives_at: Timestamp,
+    bytes: &[u8],
+) {
     let mut data = [0u8; MAX_DATAGRAM];
     let len = bytes.len().min(MAX_DATAGRAM);
     data[..len].copy_from_slice(&bytes[..len]);
 
-    trace.push(Datagram { from, to, len, data });
-    queue.push_back(Datagram { from, to, len, data });
+    trace.push(Datagram { from, to, len, arrives_at, data });
+    queue.push_back(Datagram { from, to, len, arrives_at, data });
+}
+
+/// Removes every datagram at the front of the queue that has arrived by `now`.
+fn take_due(queue: &mut VecDeque<Datagram>, now: Timestamp) -> Vec<Datagram> {
+    let due = queue.iter().take_while(|d| d.arrives_at <= now).count();
+    queue.drain(..due).collect()
 }
 
 /// A server and a client with a wire between them.
 pub struct Pair {
     now: Timestamp,
+
+    latency: Duration,
 
     pub server: Endpoint,
     pub server_addr: SocketAddr,
@@ -127,11 +149,15 @@ pub struct Pair {
 }
 
 impl Pair {
+    pub fn new(channels: ChannelSet, client_id: u64) -> Self {
+        Self::with_latency(channels, client_id, Duration::ZERO)
+    }
+
     /// Builds a pair whose client already holds a ticket for the server.
     ///
     /// `client_id` and `token_id` are the backend's to choose; one ticket per
     /// connection attempt is all the server requires.
-    pub fn new(channels: ChannelSet, client_id: u64) -> Self {
+    pub fn with_latency(channels: ChannelSet, client_id: u64, latency: Duration) -> Self {
         let now = Timestamp::ZERO;
         let backend_key: Key = [0x5A; 32];
         let server_addr: SocketAddr = str::parse("10.0.0.1:9000").expect("literal address");
@@ -142,6 +168,7 @@ impl Pair {
 
         Self {
             now,
+            latency,
             server: Endpoint::new(EndpointConfig::new(16), backend_key, &channels),
             server_addr,
             server_counters: Counters::new(),
@@ -174,6 +201,45 @@ impl Pair {
         self.now = self.now.saturating_add(by);
     }
 
+    /// Changes the one-way latency for datagrams sent from here on. Those
+    /// already on the wire keep their arrival times, so lowering it mid-flight
+    /// would let later datagrams overtake earlier ones; only raise it while
+    /// anything is on the wire.
+    pub fn set_latency(&mut self, latency: Duration) {
+        self.latency = latency;
+    }
+
+    /// When the next datagram on the wire arrives.
+    fn next_arrival(&self) -> Option<Timestamp> {
+        let server = self.to_server.front().map(|d| d.arrives_at);
+        let client = self.to_client.front().map(|d| d.arrives_at);
+        server.into_iter().chain(client).min()
+    }
+
+    /// When either side next asks for its timers to run.
+    fn next_deadline(&self) -> Option<Timestamp> {
+        self.server
+            .next_timeout()
+            .into_iter()
+            .chain(self.client.next_timeout())
+            .min()
+    }
+
+    /// Moves the clock to the next arrival if nothing on the wire is due yet.
+    /// With zero latency everything sent is due at once, so this never moves.
+    fn advance_to_arrival(&mut self) {
+        if let Some(at) = self.next_arrival()
+            && (at > self.now)
+        {
+            self.now = at;
+        }
+    }
+
+    /// The client connection's smoothed round-trip estimate.
+    pub fn client_rtt(&self) -> Duration {
+        self.client.connection().expect("client is connected").rtt().smoothed()
+    }
+
     #[inline]
     pub fn is_quiet(&self) -> bool {
         self.to_server.is_empty() && self.to_client.is_empty()
@@ -198,11 +264,36 @@ impl Pair {
 
     /// Runs passes until nothing is in flight. Returns false if it never
     /// quiesced, which means something is producing a packet every pass.
+    ///
+    /// The clock moves only as far as datagrams need to arrive; timers that
+    /// fall due in between run only if a pass happens to reach them.
     pub fn settle(&mut self) -> bool {
         for _ in 0..SETTLE_LIMIT {
             self.pass();
             if self.is_quiet() {
                 return true;
+            }
+            self.advance_to_arrival();
+        }
+        false
+    }
+
+    /// Runs for `duration` of simulated time, stopping at every arrival and
+    /// deadline either side reports, as an event-driven driver would. Returns
+    /// false if some deadline stayed due however many passes ran.
+    pub fn run_for(&mut self, duration: Duration) -> bool {
+        let end = self.now.saturating_add(duration);
+        for _ in 0..RUN_LIMIT {
+            self.pass();
+            let next = self.next_arrival().into_iter().chain(self.next_deadline()).min();
+            match next {
+                Some(at) if at <= self.now => {}
+                Some(at) if at < end => self.now = at,
+                _ => {
+                    self.now = end;
+                    self.pass();
+                    return true;
+                }
             }
         }
         false
@@ -218,6 +309,8 @@ impl Pair {
             self.pass();
             if self.is_quiet() {
                 self.advance(step);
+            } else {
+                self.advance_to_arrival();
             }
         }
         condition(self)
@@ -237,8 +330,8 @@ impl Pair {
     }
 
     fn deliver(&mut self) {
-        let inbound_server = std::mem::take(&mut self.to_server);
-        let inbound_client = std::mem::take(&mut self.to_client);
+        let inbound_server = take_due(&mut self.to_server, self.now);
+        let inbound_client = take_due(&mut self.to_client, self.now);
 
         // A silenced client still runs and still transmits; nothing it sends
         // reaches the server, which is what a crashed process looks like from
@@ -259,6 +352,7 @@ impl Pair {
 
         let Pair {
             now,
+            latency,
             server,
             server_counters,
             server_inbox,
@@ -272,7 +366,7 @@ impl Pair {
 
         let mut ctx = Ctx::new(*now, server_counters);
         let mut received: Inbox = Vec::new();
-        let mut on_message = |channel, payload: &[u8]| received.push((channel, payload.to_vec()));
+        let mut on_message = |_, channel, payload: &[u8]| received.push((channel, payload.to_vec()));
         let action = server.handle_datagram(&mut ctx, datagram.from, scratch, datagram.len, out, &mut on_message);
 
         server_inbox.extend(received);
@@ -280,7 +374,14 @@ impl Pair {
         // A challenge is the one reply produced without any state existing for
         // the sender, so it does not come from `drain_transmits`.
         if let ServerAction::Respond { addr, len } = action {
-            push(to_client, trace, *server_addr, addr, &out[..len]);
+            push(
+                to_client,
+                trace,
+                *server_addr,
+                addr,
+                now.saturating_add(*latency),
+                &out[..len],
+            );
         }
     }
 
@@ -289,6 +390,7 @@ impl Pair {
 
         let Pair {
             now,
+            latency,
             client,
             client_counters,
             client_inbox,
@@ -310,7 +412,14 @@ impl Pair {
 
         // The cookie echo, answered immediately rather than waiting for the next transmit.
         if let ClientAction::Send(len) = action {
-            push(to_server, trace, *client_addr, *server_addr, &out[..len]);
+            push(
+                to_server,
+                trace,
+                *client_addr,
+                *server_addr,
+                now.saturating_add(*latency),
+                &out[..len],
+            );
         }
     }
 
@@ -328,6 +437,7 @@ impl Pair {
     fn transmit(&mut self) {
         let Pair {
             now,
+            latency,
             server,
             server_counters,
             server_addr,
@@ -341,18 +451,20 @@ impl Pair {
             ..
         } = self;
 
+        let arrives_at = now.saturating_add(*latency);
         let mut server_ctx = Ctx::new(*now, server_counters);
         let mut outbox = Outbox {
             queue: to_client,
             trace,
             from: *server_addr,
+            arrives_at,
             slot: Box::new([0u8; MAX_DATAGRAM]),
         };
         server.drain_transmits(&mut server_ctx, &mut outbox);
 
         let mut client_ctx = Ctx::new(*now, client_counters);
         if let Some(len) = client.poll_transmit(&mut client_ctx, out) {
-            push(to_server, trace, *client_addr, *server_addr, &out[..len]);
+            push(to_server, trace, *client_addr, *server_addr, arrives_at, &out[..len]);
         }
     }
 
@@ -367,7 +479,10 @@ impl Pair {
 
     /// Queues a message on the server's only connection.
     pub fn server_send(&mut self, channel: u8, payload: &[u8]) {
-        self.server.connections_mut()[0]
+        let handle = self.server.handles().next().expect("the server has a connection");
+        self.server
+            .connection_mut(handle)
+            .expect("the handle is live")
             .send(channel, payload)
             .expect("send queued");
     }

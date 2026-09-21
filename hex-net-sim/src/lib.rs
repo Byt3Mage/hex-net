@@ -4,7 +4,10 @@
 //! completes in milliseconds, and every random decision comes from one seed, so
 //! a failing run replays exactly.
 
-mod pair;
+pub mod net;
+pub mod pair;
+pub mod scenario;
+pub mod world;
 
 #[cfg(test)]
 mod tests;

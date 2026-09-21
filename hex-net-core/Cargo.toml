@@ -4,6 +4,9 @@ name = "hex-net-core"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+doctest = false
+
 [dependencies]
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 getrandom = "0.4.3"

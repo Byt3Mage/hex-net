@@ -1,5 +1,4 @@
-use crate::stats::Counters;
-use crate::time::Timestamp;
+use crate::{stats::Counters, time::Timestamp};
 
 /// Per-pass state threaded through the transport.
 ///

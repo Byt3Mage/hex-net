@@ -3,12 +3,25 @@
 //! Each channel is independent: a retransmit on one never holds up another, so
 //! head-of-line blocking applies only where a channel asked for it.
 
-use crate::ack::Delivered;
-use crate::arena::{Arena, MessageRef};
-use crate::bits::{BitReader, BitWriter, ReadError, WriteError};
-use crate::fixed::FixedVec;
-use crate::seq::{self, Sequence, SequenceBuffer, WireSequence};
-use crate::wire::FrameKind;
+use crate::{
+    arena::{Arena, MessageRef},
+    bits::{BitReader, BitWriter, ReadError, WriteError, bits_required},
+    fixed::FixedVec,
+    seq::{self, WireSequence},
+    wire::FrameKind,
+};
+
+/// Width of a message id on the wire.
+const MESSAGE_ID_BITS: u32 = 16;
+
+/// Bits in a message frame's fields: kind, channel, id, and length.
+const MESSAGE_FRAME_BITS: u32 =
+    FrameKind::BITS + bits_required((MAX_CHANNELS - 1) as u32) + MESSAGE_ID_BITS + bits_required(MAX_MESSAGE as u32);
+
+/// Worst-case bytes a message frame adds to its payload. Its fields plus up to
+/// seven bits of alignment before the payload, since a frame can start
+/// anywhere within a byte.
+pub const MESSAGE_FRAME_OVERHEAD: usize = (MESSAGE_FRAME_BITS as usize + 7).div_ceil(8);
 
 /// Largest message carried whole. Longer payloads are fragmented before
 /// reaching a channel.
@@ -38,11 +51,6 @@ const MAX_HELD: usize = MAX_PENDING;
 /// Messages recorded per packet. A packet reaching this cap simply carries
 /// fewer; the remainder goes in the next one.
 const MAX_MESSAGES_PER_PACKET: usize = 8;
-
-/// Packets whose contents are remembered, so an acknowledgement or a loss can be
-/// turned back into message outcomes. Two seconds at 30 packets a second, which
-/// outlives loss detection.
-const PACKET_HISTORY: usize = 64;
 
 /// Called with each delivered message, during the call that received it.
 ///
@@ -78,8 +86,8 @@ impl MessageId {
     /// Resolved against a reference both sides track, as packet sequences are.
     #[inline]
     pub fn from_wire(reference: MessageId, wire: WireSequence) -> Option<MessageId> {
-        let full = seq::reconstruct(Sequence::from_raw(reference.0 as u64), wire)?;
-        u32::try_from(full.get()).ok().map(MessageId)
+        let full = seq::reconstruct(u64::from(reference.0), wire)?;
+        u32::try_from(full).ok().map(MessageId)
     }
 
     /// How far ahead of `earlier` this is, treating both as a wrapping counter.
@@ -250,8 +258,20 @@ pub struct Written {
     reliable: bool,
 }
 
-/// Which messages rode in one packet.
+/// Which messages rode in the packet being built.
 pub type PacketMessages = FixedVec<Written, MAX_MESSAGES_PER_PACKET>;
+
+/// Identifies one reliable message awaiting its packet's fate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MessageKey {
+    channel: u8,
+    id: MessageId,
+}
+
+/// The reliable messages a sent packet carried. This is what the delivery ledger
+/// stores with the packet and hands back when its fate is known. Unreliable
+/// messages never appear here, instead released when the packet commits.
+pub type PacketRecord = FixedVec<MessageKey, MAX_MESSAGES_PER_PACKET>;
 
 /// What a channel decided about an arriving message.
 enum Accepted {
@@ -284,8 +304,6 @@ pub struct Channels {
     /// a borrow of the packet buffer.
     recv_arena: Arena<ARENA_BLOCKS>,
 
-    records: SequenceBuffer<PacketMessages, PACKET_HISTORY>,
-
     dropped_inbound: u64,
 }
 
@@ -299,8 +317,6 @@ impl Channels {
             held: FixedVec::new(),
             send_arena: Arena::new(),
             recv_arena: Arena::new(),
-            records: SequenceBuffer::new(),
-            //  staging: None,
             dropped_inbound: 0,
         }
     }
@@ -319,7 +335,7 @@ impl Channels {
 
     /// Queues a message.
     ///
-    /// `WouldBlock` means the connection cannot currently carry more: either the
+    /// `WouldBlock` means the connection cannot currently carry more. Either the
     /// peer has stopped acknowledging, or the application is outpacing the send
     /// budget.
     pub fn send(&mut self, channel: u8, payload: &[u8]) -> Result<(), SendError> {
@@ -349,7 +365,7 @@ impl Channels {
         let kind = self.kind(channel).ok_or(ReadError::OutOfRange)?;
 
         let id = if kind.needs_id() {
-            let wire = WireSequence(r.read_bits(16)? as u16);
+            let wire = WireSequence(r.read_bits(MESSAGE_ID_BITS)? as u16);
             let reference = self.reference(channel, kind);
             MessageId::from_wire(reference, wire).ok_or(ReadError::OutOfRange)?
         } else {
@@ -474,7 +490,7 @@ impl Channels {
     ///
     /// Channels are visited in configured order, so their order is a priority
     /// declaration.
-    pub fn write_frames(&mut self, w: &mut BitWriter, record: &mut PacketMessages, limit: usize) -> bool {
+    pub fn write_frames(&mut self, w: &mut BitWriter, staged: &mut PacketMessages, limit: usize) -> bool {
         let start_bits = w.bits_written();
         let mut wrote = false;
 
@@ -482,7 +498,7 @@ impl Channels {
             let Some(kind) = self.kind(channel) else { continue };
 
             loop {
-                if record.is_full() {
+                if staged.is_full() {
                     break 'channels;
                 }
                 if (w.bits_written() - start_bits).div_ceil(8) >= limit {
@@ -511,7 +527,7 @@ impl Channels {
                 }
 
                 pending.in_flight = true;
-                let _ = record.push(Written {
+                let _ = staged.push(Written {
                     channel,
                     id: pending.id,
                     reliable: kind.is_reliable(),
@@ -523,47 +539,91 @@ impl Channels {
         wrote
     }
 
-    /// The packet was sent: everything staged is in flight under `sequence`.
-    pub fn on_packet_sent(&mut self, seq: Sequence, mut messages: PacketMessages) {
-        messages.retain(|msg| {
+    /// The packet was sent. Unreliable messages are released and reliable
+    /// ones are returned as the record the delivery ledger keeps for the
+    /// packet.
+    pub fn on_packet_sent(&mut self, staged: PacketMessages) -> PacketRecord {
+        let mut record = PacketRecord::new();
+
+        staged.iter().for_each(|msg| {
             if msg.reliable {
-                return true;
+                let _ = record.push(MessageKey { channel: msg.channel, id: msg.id });
+            } else {
+                self.release_pending(msg.channel, msg.id);
             }
-            self.take_pending(msg.channel, msg.id);
-            false
         });
 
-        if !messages.is_empty() {
-            self.records.insert(seq, messages);
-        }
+        record
     }
 
     /// The packet was not sent: staged messages return to the send queues.
     ///
-    /// Without this they would be recorded as in flight under a sequence the
-    /// peer never sees, so no acknowledgement or loss would ever arrive for them
+    /// Without this they would stay marked in flight under a sequence the peer
+    /// never sees, so no acknowledgement or loss would ever arrive for them
     /// and they would stall permanently.
-    pub fn on_packet_aborted(&mut self, messages: PacketMessages) {
-        messages.iter().for_each(|msg| self.mark_lost(msg.channel, msg.id));
+    pub fn on_packet_aborted(&mut self, staged: PacketMessages) {
+        staged.iter().for_each(|msg| self.mark_lost(msg.channel, msg.id));
     }
 
-    /// Applies a packet's outcome to the messages it carried.
-    pub fn on_delivery(&mut self, event: Delivered) {
-        let Some(record) = self.records.remove(event.sequence) else { return };
-        for msg in record.iter() {
-            debug_assert!(msg.reliable, "only reliable messages reach a record");
-            if event.confirmed {
-                self.take_pending(msg.channel, msg.id);
-            } else {
-                self.mark_lost(msg.channel, msg.id);
+    /// The packet carrying `record` was acknowledged
+    pub fn on_acked(&mut self, record: PacketRecord) {
+        record.iter().for_each(|key| self.release_pending(key.channel, key.id));
+    }
+
+    /// The packet carrying `record` was lost
+    pub fn on_lost(&mut self, record: PacketRecord) {
+        record.iter().for_each(|key| self.mark_lost(key.channel, key.id));
+    }
+
+    /// Marks up to `max` of the oldest unacknowledged messages as unsent, so
+    /// the next packet carries them again.
+    ///
+    /// Used for probes: a packet that has to go out anyway is worth more
+    /// carrying the data whose acknowledgement is being waited on, since the
+    /// reply then completes those messages rather than merely revealing that
+    /// an earlier packet was lost. The originals stay tracked; whichever copy
+    /// arrives first is the one that counts, and the receiver discards the
+    /// other.
+    pub fn requeue_oldest(&mut self, max: usize) -> usize {
+        let mut requeued = 0;
+        for pending in self.pending.iter_mut() {
+            if requeued == max {
+                break;
+            }
+            if pending.in_flight {
+                pending.in_flight = false;
+                requeued += 1;
             }
         }
+        requeued
+    }
+
+    /// Messages queued to send or awaiting their packet's outcome. Zero once
+    /// everything sent has been acknowledged.
+    #[inline]
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Payload length of the message the next packet tries first, if one is
+    /// waiting to be sent.
+    ///
+    /// `write_frames` visits channels in configured order, oldest message
+    /// first, and a message that does not fit the allowance ends the attempt.
+    /// So this message's size alone decides when sending can resume.
+    pub fn next_unsent_len(&self) -> Option<usize> {
+        (0..(self.set.len() as u8)).find_map(|channel| {
+            self.pending
+                .iter()
+                .find(|m| (m.channel == channel) && !m.in_flight)
+                .map(|m| m.message.len())
+        })
     }
 
     /// Removes a message from the send queue and frees its storage. Used when a
     /// reliable message is acknowledged and when an unreliable one's packet
     /// commits. In both cases the message has no further outcome.
-    fn take_pending(&mut self, channel: u8, id: MessageId) {
+    fn release_pending(&mut self, channel: u8, id: MessageId) {
         let Some(at) = self.pending.iter().position(|m| (m.channel == channel) && (m.id == id)) else {
             return;
         };
@@ -591,7 +651,7 @@ fn write_message_frame<const N: usize>(
 ) -> Result<(), WriteError> {
     w.write_range(pending.channel as u32, 0, (MAX_CHANNELS - 1) as u32)?;
     if kind.needs_id() {
-        w.write_bits(pending.id.to_wire().0 as u32, 16)?;
+        w.write_bits(u32::from(pending.id.to_wire().0), MESSAGE_ID_BITS)?;
     }
     w.write_range(pending.message.len() as u32, 0, MAX_MESSAGE as u32)?;
     // Byte-aligned so the payload copies as blocks rather than bit by bit. The
