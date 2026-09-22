@@ -112,3 +112,55 @@ fn jitter_on_a_short_path_is_not_queueing() {
     }
     assert!(!budget.is_constrained(), "rate fell to {}", budget.rate());
 }
+
+#[test]
+fn a_held_acknowledgement_is_not_queueing() {
+    let config = BudgetConfig::DEFAULT;
+    let mut budget = Budget::new(Timestamp::ZERO, config);
+    let mut delivery: Delivery<(), 8> = Delivery::new(Timestamp::ZERO, MaxAckDelay::DEFAULT);
+    let mut now = Timestamp::ZERO;
+
+    // A 1 ms path whose peer holds every acknowledgement for most of its
+    // delay budget, and reports the hold. The round trips measured are long
+    // and uneven; the path underneath is not queueing.
+    for n in 1..=200u64 {
+        let held = Span::from_millis(((n % 5) * 10) + 5);
+        let sequence = Sequence::new(n).expect("nonzero");
+        delivery.on_sent(now, sequence, Outgoing::Eliciting(()), |_| {});
+        now = now.saturating_add(Span::from_millis(1).saturating_add(held));
+        delivery.on_ack(now, sequence, Some(held), 0, |_| {});
+        budget.on_sent(100, true);
+        budget.assess(now, delivery.rtt());
+    }
+    assert!(!budget.is_constrained(), "rate fell to {}", budget.rate());
+}
+
+#[test]
+fn a_path_whose_floor_rises_is_queueing() {
+    let config = BudgetConfig::DEFAULT;
+    let mut budget = Budget::new(Timestamp::ZERO, config);
+    let mut delivery: Delivery<(), 8> = Delivery::new(Timestamp::ZERO, MaxAckDelay::DEFAULT);
+    let mut now = Timestamp::ZERO;
+
+    let mut exchange = |budget: &mut Budget, now: &mut Timestamp, n: u64, rtt: u64| {
+        let sequence = Sequence::new(n).expect("nonzero");
+        delivery.on_sent(*now, sequence, Outgoing::Eliciting(()), |_| {});
+        *now = now.saturating_add(Span::from_millis(rtt));
+        delivery.on_ack(*now, sequence, Some(Span::ZERO), 0, |_| {});
+        budget.on_sent(100, true);
+        budget.assess(*now, delivery.rtt());
+    };
+
+    // An empty 10 ms path, which becomes the baseline.
+    for n in 1..=100u64 {
+        exchange(&mut budget, &mut now, n, 10);
+    }
+    assert!(!budget.is_constrained(), "an empty path is not queueing");
+
+    // A buffer fills: every round trip now takes 60 ms, so the floor has
+    // risen rather than the average.
+    for n in 101..=200u64 {
+        exchange(&mut budget, &mut now, n, 60);
+    }
+    assert!(budget.is_constrained(), "a standing queue backs the rate off");
+}

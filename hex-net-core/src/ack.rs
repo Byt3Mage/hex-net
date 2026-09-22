@@ -69,11 +69,15 @@ const _: () = assert!(
 /// out another, doubled timeout.
 const PROBE_PACKETS: u8 = 2;
 
-/// The minimum RTT is taken over a window of this length, so a route change
-/// or one unusually fast sample stops defining "no queueing" once it ages out.
+/// The baseline minimum RTT is taken over a window of this length, so a route
+/// change or one unusually fast sample stops defining "no queueing" once it
+/// ages out.
 const MIN_RTT_WINDOW: Span = Span::from_secs(10);
-/// Half the window, which is how often the minimum rolls over.
-const MIN_RTT_HALF_WINDOW: Span = Span::from_nanos(MIN_RTT_WINDOW.as_nanos() / 2);
+/// The recent minimum is taken over a window of this length: long enough to
+/// hold several samples at game rates, short enough that a queue which formed
+/// a moment ago is visible in it while the baseline still describes the empty
+/// path.
+const RECENT_RTT_WINDOW: Span = Span::from_millis(500);
 
 /// What became of a packet. Each tracked packet produces exactly one
 /// `Acked` or `Lost`, carrying the record stored when it was sent. A packet
@@ -121,20 +125,26 @@ struct Sent<P> {
 /// Minimum over a sliding window, kept as two half-windows so it needs no
 /// sample history: the reported minimum covers between one half and the whole
 /// window.
+///
+/// The window is a type parameter, so the two the estimator keeps cannot be
+/// confused for one another and neither carries its length at runtime.
 #[derive(Clone, Copy, Debug)]
-struct WindowedMin {
+struct WindowedMin<const WINDOW_NANOS: u64> {
     current: Span,
     previous: Span,
     epoch: Timestamp,
 }
 
-impl WindowedMin {
+impl<const WINDOW_NANOS: u64> WindowedMin<WINDOW_NANOS> {
+    const HALF_WINDOW: Span = Span::from_nanos(WINDOW_NANOS / 2);
+
     fn new(now: Timestamp, sample: Span) -> Self {
+        const { assert!(WINDOW_NANOS > 1, "a windowed minimum needs a window to roll over") };
         Self { current: sample, previous: sample, epoch: now }
     }
 
     fn update(&mut self, now: Timestamp, sample: Span) {
-        if now.since(self.epoch) >= MIN_RTT_HALF_WINDOW {
+        if now.since(self.epoch) >= Self::HALF_WINDOW {
             self.previous = self.current;
             self.current = sample;
             self.epoch = now;
@@ -156,8 +166,13 @@ struct Estimate {
     /// Mean deviation: jitter. Two paths with the same average but different
     /// jitter need different timer margins, which the probe timeout applies.
     variation: Span,
-    /// Lowest seen recently, approximating the path with empty queues.
-    min: WindowedMin,
+    /// Lowest seen over the long window, approximating the path with empty
+    /// queues.
+    min: WindowedMin<{ MIN_RTT_WINDOW.as_nanos() }>,
+    /// Lowest seen over the short window, which is the path's floor as it
+    /// stands now. A queue raises this while the baseline still describes the
+    /// path without one.
+    recent: WindowedMin<{ RECENT_RTT_WINDOW.as_nanos() }>,
 }
 
 /// Round-trip estimate following RFC 6298, with the acknowledgement-delay
@@ -192,6 +207,14 @@ impl Rtt {
         self.estimate.map(|e| e.min.get())
     }
 
+    /// The lowest round trip seen in the last half second or so, which is what
+    /// the path can currently deliver. Above `min` by more than jitter
+    /// explains means a queue has formed.
+    #[inline]
+    pub fn recent_min(&self) -> Option<Span> {
+        self.estimate.map(|e| e.recent.get())
+    }
+
     /// Forgets the path. Used when the peer's address changes, since every
     /// figure here described the old route.
     pub fn reset(&mut self) {
@@ -207,12 +230,14 @@ impl Rtt {
                 smoothed: sample,
                 variation: sample.scaled::<1, 2>(),
                 min: WindowedMin::new(now, sample),
+                recent: WindowedMin::new(now, sample),
             });
             return;
         };
 
         estimate.latest = sample;
         estimate.min.update(now, sample);
+        estimate.recent.update(now, sample);
 
         // Remove the peer's holding time, but never below the best round trip
         // seen: a correction that deep means the reported delay is wrong.

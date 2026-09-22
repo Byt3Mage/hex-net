@@ -89,18 +89,22 @@ const fn whole_bytes(tokens: u64) -> u32 {
     (tokens >> FRACTION_BITS) as u32
 }
 
+/// Assessments in a row that must see a queue before the rate comes down.
+/// A queue worth reacting to outlasts one round trip; a burst that clears
+/// within one is not worth halving a player's snapshot rate over.
+const QUEUE_PERSISTENCE: u8 = 2;
+
 pub struct Budget {
     config: BudgetConfig,
-
     rate: u32,
     refill: Refill,
     tokens: u64,
     capacity: u64,
     last_refill: Timestamp,
-
     last_assessed: Timestamp,
     window_sent: u32,
     window_lost: u32,
+    queue_signals: u8,
 }
 
 impl Budget {
@@ -116,6 +120,7 @@ impl Budget {
             last_assessed: now,
             window_sent: 0,
             window_lost: 0,
+            queue_signals: 0,
         }
     }
 
@@ -197,6 +202,7 @@ impl Budget {
         self.last_assessed = now;
         self.window_sent = 0;
         self.window_lost = 0;
+        self.queue_signals = 0;
     }
 
     /// Moves the rate once a round trip, on enough evidence to read.
@@ -219,7 +225,12 @@ impl Budget {
         self.window_sent = 0;
         self.window_lost = 0;
 
-        if lossy || is_queueing(rtt) {
+        // Loss is unambiguous and acted on at once. A queue is inferred, so it
+        // has to hold across assessments before it costs the connection rate.
+        self.queue_signals = if is_queueing(rtt) { self.queue_signals.saturating_add(1) } else { 0 };
+
+        if lossy || (self.queue_signals >= QUEUE_PERSISTENCE) {
+            self.queue_signals = 0;
             self.decrease();
         } else {
             self.increase();
@@ -257,10 +268,17 @@ fn assess_interval(rtt: &Rtt) -> Span {
     rtt.smoothed().max(MIN_ASSESS_INTERVAL)
 }
 
-/// Queueing shows as a smoothed round trip standing above the path's recent
-/// best by more than jitter explains.
+/// Queueing shows as the path's floor rising: the best round trip seen in the
+/// last half second standing above the best seen over the long window by more
+/// than jitter explains.
+///
+/// Both sides of the comparison are minima. An average would also carry the
+/// peer's acknowledgement hold, both sides' scheduling, and ordinary jitter,
+/// none of which is a queue, and all of which a full buffer is indifferent to.
 fn is_queueing(rtt: &Rtt) -> bool {
-    let Some(min) = rtt.min() else { return false };
-    let margin = Span::from_nanos(min.as_nanos() / u64::from(QUEUE_THRESHOLD_DIVISOR)).max(MIN_QUEUE_DELAY);
-    rtt.smoothed() > min.saturating_add(margin)
+    let (Some(baseline), Some(recent)) = (rtt.min(), rtt.recent_min()) else {
+        return false;
+    };
+    let margin = Span::from_nanos(baseline.as_nanos() / u64::from(QUEUE_THRESHOLD_DIVISOR)).max(MIN_QUEUE_DELAY);
+    recent > baseline.saturating_add(margin)
 }

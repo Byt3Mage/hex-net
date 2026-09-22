@@ -49,7 +49,7 @@ use hex_net_core::{
 };
 use hex_net_io::{
     Socket, Wait,
-    driver::{ClientApp, ClientDriver, ServerApp, ServerDriver},
+    driver::{ClientApp, ClientDriver, DEFAULT_STEP_INTERVAL, ServerApp, ServerDriver},
     portable::PortableSocket,
     run::{serve_step, stop_pair},
 };
@@ -114,6 +114,7 @@ struct Options {
     seconds: u64,
     snapshot_hz: u32,
     load_threads: usize,
+    step_interval: Span,
     portable: bool,
 }
 
@@ -124,6 +125,7 @@ impl Options {
             seconds: 5,
             snapshot_hz: 30,
             load_threads: thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1)),
+            step_interval: DEFAULT_STEP_INTERVAL,
             portable: !cfg!(target_os = "linux"),
         };
         let mut args = env::args().skip(1);
@@ -133,6 +135,7 @@ impl Options {
                 "--seconds" => options.seconds = number(args.next(), "--seconds"),
                 "--snapshot-hz" => options.snapshot_hz = number(args.next(), "--snapshot-hz"),
                 "--load-threads" => options.load_threads = number(args.next(), "--load-threads"),
+                "--step-us" => options.step_interval = Span::from_micros(number(args.next(), "--step-us")),
                 "--portable" => options.portable = true,
                 // Added by `cargo bench` itself.
                 "--bench" => {}
@@ -519,6 +522,7 @@ where
         ..EndpointConfig::new(capacity)
     };
     let mut server = ServerDriver::new(socket, Endpoint::new(config, BACKEND_KEY, &CHANNELS));
+    server.set_step_interval(options.step_interval);
 
     let (server_accounting_tx, server_accounting) = mpsc::channel();
     let (stopper, signal) = stop_pair(server.socket().waker().expect("a waker"));
@@ -656,7 +660,7 @@ fn report(options: &Options, connected: u64, before: &Sample, after: &Sample) {
         )
     );
     println!(
-        "  snapshots refused by the budget: {}, server ticks started late: {}",
+        "  snapshots the connection could not queue: {}, server ticks started late: {}",
         after.snapshots_refused - before.snapshots_refused,
         after.ticks_late - before.ticks_late
     );
@@ -690,6 +694,32 @@ fn report(options: &Options, connected: u64, before: &Sample, after: &Sample) {
 /// Whole-run datagram totals from the drivers' own counters.
 fn totals<S: Socket>(server: &ServerDriver<S>, clients: &[(ClientDriver<S>, Player)]) {
     let server_counters = server.counters();
+    let rates: Vec<u32> = server.endpoint().connections().iter().map(|c| c.send_rate()).collect();
+    let constrained = rates.iter().filter(|rate| **rate < RATE).count();
+    let lowest = rates.iter().copied().min().unwrap_or(RATE);
+    let mut worst: Vec<(u32, u64, u64)> = server
+        .endpoint()
+        .connections()
+        .iter()
+        .map(|c| {
+            (
+                c.send_rate(),
+                c.rtt().smoothed().as_nanos() / 1000,
+                c.rtt().min().unwrap_or(Span::ZERO).as_nanos() / 1000,
+            )
+        })
+        .collect();
+    worst.sort();
+    println!(
+        "  slowest five (rate B/s, smoothed us, min us): {:?}",
+        &worst[..worst.len().min(5)]
+    );
+    println!(
+        "  loss and rate: {} packets declared lost, {} of those arrived after all; {constrained} of {} connections below the configured rate, lowest {lowest} B/s of {RATE}",
+        server_counters.get(Counter::PacketsLost),
+        server_counters.get(Counter::PacketsSpuriouslyLost),
+        rates.len()
+    );
     let client_total = |counter| -> u64 { clients.iter().map(|(driver, _)| driver.counters().get(counter)).sum() };
     let client_sent = client_total(Counter::DatagramsSent);
     println!(

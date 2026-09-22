@@ -194,9 +194,10 @@ struct ControlQueue {
 }
 
 impl ControlQueue {
-    fn new() -> ControlQueue {
+    /// `owed` is what this side owes from the moment it exists.
+    fn new(owed: Owed) -> ControlQueue {
         ControlQueue {
-            owed: Owed::NONE,
+            owed,
             path_challenge: 0,
             path_response: 0,
             ticket: EncryptedTicket::new(),
@@ -382,6 +383,7 @@ pub struct Connection<R: Role> {
 }
 
 impl<R: Role> Connection<R> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         now: Timestamp,
         id: ConnectionId,
@@ -389,6 +391,7 @@ impl<R: Role> Connection<R> {
         keys: &ConnectionKeys,
         channels: ChannelSet,
         transport: TransportConfig,
+        control: Owed,
         role: R,
     ) -> Self {
         let (tx, rx) = R::split_keys(keys);
@@ -400,7 +403,7 @@ impl<R: Role> Connection<R> {
             delivery: Delivery::new(now, transport.max_ack_delay),
             budget: Budget::new(now, transport.budget),
             channels: Channels::new(channels),
-            control: ControlQueue::new(),
+            control: ControlQueue::new(control),
             ack: AckOwed::Nothing,
             ack_delay: transport.max_ack_delay.get(),
             liveness: transport.liveness,
@@ -890,6 +893,7 @@ impl Connection<Client> {
             keys,
             channels,
             transport,
+            Owed::NONE,
             Client { ticket: ResumeTicket::None },
         )
     }
@@ -991,6 +995,7 @@ impl Connection<Server> {
             keys,
             channels,
             transport,
+            Owed::ACCEPTED,
             Server { session, ticket, probe: None },
         )
     }
