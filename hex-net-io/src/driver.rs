@@ -5,8 +5,11 @@
 //! returned deadline to arrive, belongs to the caller, which is what lets one
 //! driver run over a real socket and over the simulator alike.
 
-use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::{
+    io,
+    net::{Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
 use hex_net_core::{
     connector::{Action as ClientAction, Connector, State},
@@ -22,7 +25,7 @@ use hex_net_core::{
 use crate::{Received, Socket, Transmit};
 
 /// Datagrams taken from the socket per call.
-const RECV_BATCH: usize = 32;
+const RECV_BATCH: usize = 62;
 
 /// Batches read in one step before the step moves on to timers and sending.
 /// Under a flood of arrivals, reading until the socket is empty would never
@@ -33,7 +36,7 @@ const RECV_ROUNDS: usize = 8;
 /// Packets built before the socket is called to send them. A packet going to
 /// a path under validation is sent twice, so a flush carries up to twice
 /// this many datagrams.
-const SEND_BATCH: usize = 32;
+const SEND_BATCH: usize = 62;
 
 const MAX_TRANSMITS: usize = SEND_BATCH * 2;
 
@@ -168,6 +171,15 @@ impl PacketSink for Outbox {
     }
 }
 
+/// Shortest time between the starts of two server steps that arrivals alone
+/// wake. Datagrams arriving in between wait in the kernel, so one step reads
+/// them in full batches and its system calls are shared by all of them.
+///
+/// Deadlines are not held back by it, and arrival times come from the kernel,
+/// so round-trip samples are unaffected. What it adds is up to this long before
+/// a datagram is read.
+pub const DEFAULT_STEP_INTERVAL: Duration = Duration::from_millis(1);
+
 /// Runs an endpoint over a socket.
 pub struct ServerDriver<S: Socket> {
     socket: S,
@@ -176,6 +188,7 @@ pub struct ServerDriver<S: Socket> {
     inbox: Inbox,
     reply: Box<Packet>,
     outbox: Outbox,
+    step_interval: Duration,
 }
 
 impl<S: Socket> ServerDriver<S> {
@@ -187,7 +200,20 @@ impl<S: Socket> ServerDriver<S> {
             inbox: Inbox::new(),
             reply: Box::new([0u8; MAX_DATAGRAM]),
             outbox: Outbox::new(),
+            step_interval: DEFAULT_STEP_INTERVAL,
         }
+    }
+
+    /// How long after a step's start the next may begin, when only arrivals
+    /// would wake it. Zero steps on every arrival.
+    #[inline]
+    pub fn step_interval(&self) -> Duration {
+        self.step_interval
+    }
+
+    #[inline]
+    pub fn set_step_interval(&mut self, interval: Duration) {
+        self.step_interval = interval;
     }
 
     #[inline]

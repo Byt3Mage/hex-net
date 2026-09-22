@@ -5,8 +5,8 @@
 use std::net::SocketAddr;
 
 use crate::{
-    budget::BudgetConfig,
     channel::{ChannelKind, ChannelSet},
+    config::TransportConfig,
     connector::{Action as ClientAction, Connector, State},
     crypto::{Key, Keys, MAX_BLOB},
     ctx::Ctx,
@@ -66,7 +66,7 @@ fn connector(ticket: EncryptedTicket) -> Connector {
         ticket,
         keys(),
         CHANNELS,
-        BudgetConfig::DEFAULT,
+        TransportConfig::DEFAULT,
     )
 }
 

@@ -2,24 +2,30 @@
 //! event loop would drive them: each node is stepped only when a datagram has
 //! landed for it or a deadline it reported has come.
 
-use std::cell::{Cell, RefCell};
-use std::cmp::Ordering;
-use std::collections::{BTreeSet, BinaryHeap, HashMap};
-use std::net::{Ipv4Addr, SocketAddr};
-use std::rc::Rc;
-use std::time::Duration;
+use std::{
+    cell::{Cell, RefCell},
+    cmp::Ordering,
+    collections::{BTreeSet, BinaryHeap, HashMap},
+    net::{Ipv4Addr, SocketAddr},
+    rc::Rc,
+    time::Duration,
+};
 
-use hex_net_core::budget::BudgetConfig;
-use hex_net_core::channel::ChannelSet;
-use hex_net_core::connector::Connector;
-use hex_net_core::crypto::{Key, Keys};
-use hex_net_core::endpoint::{Endpoint, EndpointConfig};
-use hex_net_core::handshake::{EncryptedTicket, SessionId};
-use hex_net_core::time::Timestamp;
+use hex_net_core::{
+    channel::ChannelSet,
+    config::TransportConfig,
+    connector::Connector,
+    crypto::{Key, Keys},
+    endpoint::{Endpoint, EndpointConfig},
+    handshake::{EncryptedTicket, SessionId},
+    time::Timestamp,
+};
 use hex_net_io::driver::{ClientApp, ClientDriver, ServerApp, ServerDriver};
 
-use crate::net::{Link, SimSocket, Wire, WireStats};
-use crate::pair::{issue_ticket, session_keys};
+use crate::{
+    net::{Link, SimSocket, Wire, WireStats},
+    pair::{issue_ticket, session_keys},
+};
 
 /// Steps at one instant before the run is declared stuck: some deadline stays
 /// due however often its node is stepped.
@@ -159,7 +165,7 @@ impl<S: ServerApp, C: ClientApp> World<S, C> {
             ticket,
             keys,
             self.channels,
-            BudgetConfig::DEFAULT,
+            TransportConfig::DEFAULT,
         )
     }
 

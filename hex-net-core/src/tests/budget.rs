@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::ack::{Delivery, Outgoing, Rtt};
 use crate::budget::{Budget, BudgetConfig, MIN_PACKET, MIN_RATE};
+use crate::config::MaxAckDelay;
 use crate::seq::Sequence;
 use crate::time::Timestamp;
 use crate::wire::MAX_DATAGRAM;
@@ -97,7 +98,7 @@ fn acknowledgement_only_packets_do_not_dilute_the_loss_rate() {
 fn jitter_on_a_short_path_is_not_queueing() {
     let config = BudgetConfig::DEFAULT;
     let mut budget = Budget::new(Timestamp::ZERO, config);
-    let mut delivery: Delivery<(), 8> = Delivery::new(Timestamp::ZERO);
+    let mut delivery: Delivery<(), 8> = Delivery::new(Timestamp::ZERO, MaxAckDelay::DEFAULT);
     let mut now = Timestamp::ZERO;
 
     // A 10 ms path wandering up to 16 ms: a 25% margin alone would call this

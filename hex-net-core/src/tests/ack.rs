@@ -3,7 +3,8 @@
 use std::time::Duration;
 
 use crate::{
-    ack::{Delivery, MAX_ACK_DELAY, Outgoing, Resolved, decode_ack_delay, encode_ack_delay},
+    ack::{Delivery, Outgoing, Resolved, decode_ack_delay, encode_ack_delay},
+    config::MaxAckDelay,
     seq::Sequence,
     time::Timestamp,
 };
@@ -26,7 +27,7 @@ struct Ledger {
 impl Ledger {
     fn new() -> Self {
         Self {
-            delivery: Delivery::new(at(0)),
+            delivery: Delivery::new(at(0), MaxAckDelay::DEFAULT),
             outcomes: Vec::new(),
         }
     }
@@ -110,14 +111,14 @@ fn an_unacknowledged_tail_is_probed_not_declared_lost() {
     ledger.send(at(0), 1);
 
     // Unmeasured: 100 ms assumed, 50 ms deviation, plus the peer's holding time.
-    let first = at(0).saturating_add(Duration::from_millis(100 + 200) + MAX_ACK_DELAY);
+    let first = at(0).saturating_add(Duration::from_millis(100 + 200) + MaxAckDelay::DEFAULT.get());
     assert_eq!(ledger.delivery.next_timeout(), Some(first));
     assert_eq!(ledger.tick(at(324)), 0);
     assert_eq!(ledger.tick(first), 2, "a probe timeout owes two packets");
     assert!(ledger.take().is_empty(), "a probe is not a loss");
 
     // Backoff: measured from the last eliciting send, doubled.
-    let second = at(0).saturating_add((Duration::from_millis(100 + 200) + MAX_ACK_DELAY) * 2);
+    let second = at(0).saturating_add((Duration::from_millis(100 + 200) + MaxAckDelay::DEFAULT.get()) * 2);
     assert_eq!(ledger.delivery.next_timeout(), Some(second));
 
     // The probe's acknowledgement puts packet 1 before the largest acked.

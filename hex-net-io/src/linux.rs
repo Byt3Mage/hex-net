@@ -28,7 +28,7 @@ use std::{
 use hex_net_core::{
     shard::{SHARD_BITS, Shard, ShardGroup},
     time::{Clock, MonotonicClock, Timestamp},
-    wire::{HANDSHAKE_BODY_OFFSET, HANDSHAKE_LEN, KIND_MASK, MIN_PAYLOAD_HEADER, PacketKind, SHARD_OFFSET},
+    wire::{HANDSHAKE_BODY_OFFSET, HANDSHAKE_LEN, MIN_PAYLOAD_HEADER, PacketKind, SHARD_OFFSET, flags::KIND_MASK},
 };
 
 use crate::{Received, Socket, Transmit, Wait, Wake, canonical, outgoing};
@@ -338,6 +338,44 @@ impl Wait for LinuxSocket {
             }
         }
         Ok(())
+    }
+
+    fn park(&self, timeout: Duration) -> io::Result<bool> {
+        let mut fds = [libc::pollfd {
+            fd: self.event.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let limit = libc::timespec {
+            tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
+            tv_nsec: timeout.subsec_nanos() as libc::c_long,
+        };
+
+        // SAFETY: `fds` is one initialised pollfd, the count given. `limit`
+        // outlives the call. A null signal mask leaves the thread's mask as it
+        // is.
+        let ready = unsafe {
+            libc::ppoll(
+                fds.as_mut_ptr(),
+                fds.len() as libc::nfds_t,
+                &raw const limit,
+                ptr::null(),
+            )
+        };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == ErrorKind::Interrupted { Ok(false) } else { Err(error) };
+        }
+        if (fds[0].revents & libc::POLLIN) == 0 {
+            return Ok(false);
+        }
+
+        let mut count = [0u8; 8];
+        match (&*self.event).read(&mut count) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     fn waker(&self) -> io::Result<LinuxWaker> {

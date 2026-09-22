@@ -10,8 +10,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use hex_net_core::{
-    budget::BudgetConfig,
     channel::ChannelSet,
+    config::{MaxAckDelay, TransportConfig},
     connector::{Action as ClientAction, Connector, State as ClientState},
     crypto::{Key, Keys, MAX_BLOB},
     ctx::Ctx,
@@ -117,6 +117,14 @@ fn take_due(queue: &mut VecDeque<Datagram>, now: Timestamp) -> Vec<Datagram> {
     queue.drain(..due).collect()
 }
 
+/// What both sides of a pair run with unless a test says otherwise:
+/// acknowledgements go out on the next transmit, so an exchange can be read
+/// pass by pass.
+pub const PAIR_TRANSPORT: TransportConfig = TransportConfig {
+    max_ack_delay: MaxAckDelay::IMMEDIATE,
+    ..TransportConfig::DEFAULT
+};
+
 /// A server and a client with a wire between them.
 pub struct Pair {
     now: Timestamp,
@@ -158,6 +166,10 @@ impl Pair {
     /// `client_id` is the are the backend's to choose. A ticket is spent by the
     /// handshake it completes, so each connection needs a fresh one.
     pub fn with_latency(channels: ChannelSet, client_id: u64, latency: Duration) -> Self {
+        Self::with_transport(channels, client_id, latency, PAIR_TRANSPORT)
+    }
+
+    pub fn with_transport(channels: ChannelSet, client_id: u64, latency: Duration, transport: TransportConfig) -> Self {
         let now = Timestamp::ZERO;
         let backend_key: Key = [0x5A; 32];
         let server_addr: SocketAddr = str::parse("10.0.0.1:9000").expect("literal address");
@@ -169,14 +181,18 @@ impl Pair {
         Self {
             now,
             latency,
-            server: Endpoint::new(EndpointConfig::new(16), backend_key, &channels),
+            server: Endpoint::new(
+                EndpointConfig { transport, ..EndpointConfig::new(16) },
+                backend_key,
+                &channels,
+            ),
             server_addr,
             server_counters: Counters::new(),
             server_events: Vec::new(),
             server_inbox: Vec::new(),
             server_actions: Vec::new(),
 
-            client: Connector::connect(now, server_addr, ticket, keys, channels, BudgetConfig::DEFAULT),
+            client: Connector::connect(now, server_addr, ticket, keys, channels, transport),
             client_addr,
             client_counters: Counters::new(),
             client_inbox: Vec::new(),

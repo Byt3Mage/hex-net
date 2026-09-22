@@ -5,11 +5,12 @@ use std::time::Duration;
 
 use hex_net_core::{
     channel::{ChannelKind, ChannelSet},
+    config::{MaxAckDelay, TransportConfig},
     connector::State as ClientState,
     stats::Counter,
 };
 
-use crate::pair::Pair;
+use crate::pair::{Datagram, Pair};
 
 const ORDERED: ChannelSet = ChannelSet::new([ChannelKind::ReliableOrdered]);
 
@@ -99,4 +100,62 @@ fn an_idle_connection_driven_by_deadlines_stays_up() {
     assert_eq!(pair.server.num_connections(), 1);
     assert_eq!(pair.client_counters.get(Counter::PacketsLost), 0);
     assert_eq!(pair.server_counters.get(Counter::PacketsLost), 0);
+}
+
+/// A connected pair on a wire with no delay, both sides holding
+/// acknowledgements for the default time.
+fn deferring_pair() -> Pair {
+    let mut pair = Pair::with_transport(ORDERED, 1, Duration::ZERO, TransportConfig::DEFAULT);
+    assert!(pair.settle(), "the handshake completed");
+    assert_eq!(pair.client_state(), ClientState::Connected);
+    pair
+}
+
+/// Datagrams the server has sent, oldest first.
+fn from_server(pair: &Pair) -> Vec<&Datagram> {
+    pair.trace.iter().filter(|d| d.from == pair.server_addr).collect()
+}
+
+#[test]
+fn an_acknowledgement_waits_for_a_packet_with_frames_to_carry_it() {
+    let mut pair = deferring_pair();
+
+    pair.client_send(0, b"input");
+    pair.pass();
+    pair.pass();
+    let before = from_server(&pair).len();
+    pair.pass();
+    assert_eq!(from_server(&pair).len(), before, "the server held its acknowledgement");
+
+    pair.server_send(0, b"snapshot");
+    pair.pass();
+    let sent = from_server(&pair);
+    assert_eq!(
+        sent.len(),
+        before + 1,
+        "one packet carried the message and the acknowledgement"
+    );
+    let header = sent[before].header().expect("a payload header");
+    assert!(header.ack.is_some(), "the acknowledgement rode on the message");
+}
+
+#[test]
+fn an_acknowledgement_with_nothing_to_carry_it_goes_alone_at_its_deadline() {
+    let mut pair = deferring_pair();
+    let delay = MaxAckDelay::DEFAULT.get();
+
+    pair.client_send(0, b"input");
+    pair.pass();
+    pair.pass();
+    let before = from_server(&pair).len();
+
+    pair.advance(delay - Duration::from_millis(1));
+    pair.pass();
+    assert_eq!(from_server(&pair).len(), before, "still within the delay");
+
+    pair.advance(Duration::from_millis(1));
+    pair.pass();
+    let sent = from_server(&pair);
+    assert_eq!(sent.len(), before + 1, "the acknowledgement went out alone");
+    assert!(sent[before].header().expect("a payload header").ack.is_some());
 }

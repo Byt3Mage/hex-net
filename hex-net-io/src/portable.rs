@@ -102,6 +102,14 @@ impl Wait for PortableSocket {
         self.socket.set_nonblocking(true)
     }
 
+    /// The waker reaches this socket as a datagram, which cannot be told from
+    /// traffic without reading it, so a park is a plain sleep and never
+    /// reports a wake. A stop is noticed by the wait after it.
+    fn park(&self, timeout: Duration) -> io::Result<bool> {
+        std::thread::sleep(timeout);
+        Ok(false)
+    }
+
     fn waker(&self) -> io::Result<PortableWaker> {
         let target = reachable(self.local);
         let unspecified: SocketAddr = match target {

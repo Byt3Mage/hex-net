@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use crate::{
+    config::MaxAckDelay,
     seq::{Sequence, SequenceBuffer},
     time::Timestamp,
 };
@@ -41,10 +42,6 @@ const PROBE_PACKETS: u8 = 2;
 /// The minimum RTT is taken over a window of this length, so a route change
 /// or one unusually fast sample stops defining "no queueing" once it ages out.
 const MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
-
-/// Longest a peer holds an acknowledgement for a packet to ride on. The probe
-/// timeout allows for it, since the peer is entitled to wait this long.
-pub const MAX_ACK_DELAY: Duration = Duration::from_millis(25);
 
 /// Wire resolution of the acknowledgement delay field.
 pub const ACK_DELAY_UNIT: Duration = Duration::from_micros(250);
@@ -233,12 +230,16 @@ pub struct Delivery<P, const N: usize = 64> {
     in_flight: u32,
     /// Consecutive probe timeouts without an acknowledgement in between.
     probes: u32,
+    /// Longest the peer holds and acknowledgement. The probe timeout allows for,
+    /// it, since the peer is entitled to wait this long.
+    peer_ack_delay: Duration,
 }
 
 impl<P, const N: usize> Delivery<P, N> {
     /// `now` seeds the liveness timestamp, so a new connection does not look as
-    /// though it has been silent since the epoch.
-    pub fn new(now: Timestamp) -> Self {
+    /// though it has been silent since the epoch. `peer_ack_delay` is how long
+    /// the peer may hold an acknowledgement.
+    pub fn new(now: Timestamp, peer_ack_delay: MaxAckDelay) -> Self {
         Self {
             sent: SequenceBuffer::new(),
             largest_sent: None,
@@ -248,6 +249,7 @@ impl<P, const N: usize> Delivery<P, N> {
             rtt: Rtt::default(),
             in_flight: 0,
             probes: 0,
+            peer_ack_delay: peer_ack_delay.get(),
         }
     }
 
@@ -453,7 +455,7 @@ impl<P, const N: usize> Delivery<P, N> {
     /// acknowledgement that is merely late does not trigger it.
     fn probe_deadline(&self) -> Option<Timestamp> {
         let _ = self.oldest_in_flight()?;
-        let base = self.rtt.smoothed() + (self.rtt.variation() * 4).max(TIMER_GRANULARITY) + MAX_ACK_DELAY;
+        let base = self.rtt.smoothed() + (self.rtt.variation() * 4).max(TIMER_GRANULARITY) + self.peer_ack_delay;
         Some(self.last_eliciting.saturating_add(base * (1u32 << self.probes)))
     }
 

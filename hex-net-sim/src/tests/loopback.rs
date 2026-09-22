@@ -21,8 +21,8 @@ use crate::{
     scenario::{Chatter, ClientView, Echo, ServerView, Settled, assert_clean},
 };
 use hex_net_core::{
-    budget::BudgetConfig,
     channel::{ChannelKind, ChannelSet},
+    config::TransportConfig,
     connector::{Connector, State},
     crypto::Key,
     endpoint::{Endpoint, EndpointConfig, Event, ServerConnection},
@@ -74,7 +74,7 @@ fn connector(clock: &MonotonicClock, server: SocketAddr, index: usize) -> Connec
     let client_id = (index as u64) + 1;
     let keys = session_keys(client_id);
     let ticket = issue_ticket(&BACKEND_KEY, clock.now(), client_id, None, &keys);
-    Connector::connect(clock.now(), server, ticket, keys, ORDERED, BudgetConfig::DEFAULT)
+    Connector::connect(clock.now(), server, ticket, keys, ORDERED, TransportConfig::DEFAULT)
 }
 
 /// What the threads of a run report while it goes.
@@ -354,6 +354,10 @@ where
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use hex_net_core::{
+        shard::{ShardCount, ShardGroup},
+        stats::Counter,
+    };
     use hex_net_io::linux::{LinuxSocket, SocketOptions, bind_group};
 
     use super::*;

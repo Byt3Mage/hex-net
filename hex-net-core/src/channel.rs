@@ -384,7 +384,11 @@ impl Channels {
             Accepted::Discard => {}
             Accepted::Deliver => {
                 on_message(channel, payload);
-                self.flush_ordered(channel, on_message);
+                // Only an ordered channel holds anything back, and only a
+                // delivery on one can unblock what it holds.
+                if kind == ChannelKind::ReliableOrdered && !self.held.is_empty() {
+                    self.flush_ordered(channel, on_message);
+                }
             }
             Accepted::Hold => {
                 if self.held.is_full() {
@@ -460,29 +464,31 @@ impl Channels {
     }
 
     /// Delivers held messages that the last delivery unblocked.
+    ///
+    /// The staging buffer is made only once a held message is known to be
+    /// deliverable, so a delivery that unblocks nothing costs one scan.
     fn flush_ordered(&mut self, channel: u8, on_message: OnMessage) {
+        let Some(mut at) = self.next_held(channel) else { return };
         let mut staging = [0u8; MAX_MESSAGE];
 
         loop {
-            let wanted = self.receivers[channel as usize].expected;
-            let Some(at) = self
-                .held
-                .iter()
-                .position(|e| (e.channel == channel) && (e.id == wanted))
-            else {
-                return;
-            };
-
             let Some(entry) = self.held.remove(at) else { return };
-            self.receivers[channel as usize].expected = wanted.next();
-
+            self.receivers[channel as usize].expected = entry.id.next();
             // Held messages outlived their packet, so this is the one inbound
             // path that copies.
             if let Some(len) = self.recv_arena.load(entry.message, &mut staging) {
                 on_message(channel, &staging[..len]);
             }
             self.recv_arena.release(entry.message);
+            let Some(next) = self.next_held(channel) else { return };
+            at = next;
         }
+    }
+
+    /// Where the held message `channel` expects next sit, if it is held.
+    fn next_held(&self, channel: u8) -> Option<usize> {
+        let wanted = self.receivers[channel as usize].expected;
+        self.held.iter().position(|e| e.channel == channel && e.id == wanted)
     }
 
     /// Fills the remaining space, using at most `limit` bytes of the datagram's
@@ -603,6 +609,12 @@ impl Channels {
     #[inline]
     pub fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    // Whether any message is waiting for a packet to carry it.
+    #[inline]
+    pub fn has_unsent(&self) -> bool {
+        self.pending.iter().any(|m| !m.in_flight)
     }
 
     /// Payload length of the message the next packet tries first, if one is

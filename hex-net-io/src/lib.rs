@@ -83,6 +83,13 @@ pub trait Wait {
     /// the caller steps and finds out what, if anything, arrived.
     fn wait(&self, timeout: Option<Duration>) -> io::Result<()>;
 
+    /// Blocks until the waker is woken or `timeout` passes, whatever arrives
+    /// on the socket meanwhile. Returns whether a wake arrived, consuming it.
+    ///
+    /// Lets a loop gather datagrams in the kernel between steps, so each
+    /// step's system calls are shared by a larger batch.
+    fn park(&self, timeout: Duration) -> io::Result<bool>;
+
     /// A handle that wakes this socket's waits from any thread.
     fn waker(&self) -> io::Result<Self::Waker>;
 }

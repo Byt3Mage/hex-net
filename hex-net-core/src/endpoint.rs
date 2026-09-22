@@ -10,8 +10,8 @@ use std::{
 };
 
 use crate::{
-    budget::BudgetConfig,
     channel::ChannelSet,
+    config::TransportConfig,
     connection::{CloseReason, Connection, Event as ConnEvent, RecvError, Server},
     crypto::{Key, MAX_BLOB},
     ctx::Ctx,
@@ -85,7 +85,7 @@ pub struct EndpointConfig {
     /// addresses occasionally share a bucket. Oversizing relative to
     /// `capacity` makes that rare, and a shared bucket only throttles.
     pub limiter_slots: usize,
-    pub budget: BudgetConfig,
+    pub transport: TransportConfig,
     /// Which member of its group this endpoint is. An endpoint alone on its
     /// address is the only member of a group of one.
     pub shard: Shard,
@@ -100,7 +100,7 @@ impl EndpointConfig {
         Self {
             capacity,
             limiter_slots: ((capacity as usize) * 8).next_power_of_two().max(1024),
-            budget: BudgetConfig::DEFAULT,
+            transport: TransportConfig::DEFAULT,
             shard,
         }
     }
@@ -598,7 +598,7 @@ impl Endpoint {
         // The id is derived from the slot the connection is about to take,
         // and the keys from the id and both handshake nonces.
         let shard = self.shard();
-        let (channels, budget) = (self.channels, self.config.budget);
+        let (channels, transport) = (self.channels, self.config.transport);
         let inserted = self.connections.insert_with(|handle| {
             let conn_id = conn_id_for(handle, shard);
             let keys = cookie
@@ -613,7 +613,7 @@ impl Endpoint {
                 from,
                 &keys,
                 channels,
-                budget,
+                transport,
             )
         });
         let Some(handle) = inserted else {

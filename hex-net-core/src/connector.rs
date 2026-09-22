@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::{
-    budget::BudgetConfig,
     channel::{ChannelSet, OnMessage},
+    config::TransportConfig,
     connection::{Client, CloseReason, Connection, Event as ConnEvent, RecvError},
     crypto::{Keys, MAX_BLOB},
     ctx::Ctx,
@@ -80,7 +80,7 @@ pub struct Connector {
     /// alongside the ticket, and a resuming player already holds them.
     keys: Keys,
     channels: ChannelSet,
-    budget: BudgetConfig,
+    transport: TransportConfig,
 
     started: Timestamp,
     last_attempt: Option<Timestamp>,
@@ -104,7 +104,7 @@ impl Connector {
         ticket: EncryptedTicket,
         keys: Keys,
         channels: ChannelSet,
-        budget: BudgetConfig,
+        transport: TransportConfig,
     ) -> Self {
         Self {
             server,
@@ -114,7 +114,7 @@ impl Connector {
             nonce: ClientNonce::random(),
             keys,
             channels,
-            budget,
+            transport,
             started: now,
             last_attempt: None,
             connection: None,
@@ -214,7 +214,14 @@ impl Connector {
         let keys = self
             .keys
             .for_connection(header.conn_id, self.nonce, challenge.server_nonce);
-        let mut conn = Connection::connect(ctx.now, header.conn_id, self.server, &keys, self.channels, self.budget);
+        let mut conn = Connection::connect(
+            ctx.now,
+            header.conn_id,
+            self.server,
+            &keys,
+            self.channels,
+            self.transport,
+        );
 
         // Verified by decrypting: a forged acceptance cannot authenticate, and
         // failing here leaves the cookie retrying, since the real acceptance may

@@ -8,6 +8,7 @@ pub mod arena;
 pub mod bits;
 pub mod budget;
 pub mod channel;
+pub mod config;
 pub mod connection;
 pub mod connector;
 pub mod crypto;
