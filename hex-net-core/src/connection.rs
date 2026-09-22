@@ -136,10 +136,6 @@ pub trait Role: Sized + sealed::Sealed {
     /// Writes this side's control frames. Returns whether anything was written.
     fn write_control(conn: &mut Connection<Self>, w: &mut BitWriter) -> bool;
 
-    /// Whether `write_control` has anything to write.
-    fn control_pending(conn: &Connection<Self>) -> bool;
-
-    /// An authenticated packet arrived from an address other than the current
     /// one.
     fn on_address_change(conn: &mut Connection<Self>, now: Timestamp, from: SocketAddr, sequence: Sequence);
 
@@ -203,6 +199,11 @@ pub struct Connection<R: Role> {
     /// Past that it goes out on a packet of its own.
     ack_delay: Duration,
 
+    /// A packet arrived out of order, so the acknowledgement owed is not held
+    /// at all: it is what tells the peer which packets are missing, and delay
+    /// there is delay in every retransmission it prompts.
+    ack_immediately: bool,
+
     last_received: Timestamp,
 
     /// Ack-eliciting packets owed, such as a keepalive, or the probes the delivery
@@ -237,6 +238,7 @@ impl<R: Role> Connection<R> {
             channels: Channels::new(channels),
             ack_pending: None,
             ack_delay: transport.max_ack_delay.get(),
+            ack_immediately: false,
             last_received: now,
             pending_probes: 0,
             events: RingQueue::new(),
@@ -353,6 +355,7 @@ impl<R: Role> Connection<R> {
             if self.ack_pending.is_none() {
                 self.ack_pending = Some(ctx.now);
             }
+            self.ack_immediately |= !opened.in_order;
         }
 
         if from != self.addr {
@@ -422,11 +425,6 @@ impl<R: Role> Connection<R> {
         }
 
         self.budget.assess(ctx.now, self.delivery.rtt());
-
-        if !self.wants_transmit(ctx.now) {
-            return None;
-        }
-
         let allowance = self.budget.available(ctx.now) as usize;
 
         // A probe has to go out regardless, so it carries the messages whose
@@ -483,6 +481,7 @@ impl<R: Role> Connection<R> {
         });
         self.budget.on_sent(sealed.datagram_len(), eliciting);
         self.ack_pending = None;
+        self.ack_immediately = false;
 
         if eliciting {
             ctx.counters.inc(Counter::PacketsTracked);
@@ -503,25 +502,19 @@ impl<R: Role> Connection<R> {
         Some(len)
     }
 
-    /// Whether a packet built now could carry anything: a frame of any kind,
-    /// or an acknowledgement that has waited long enough to go alone.
-    ///
-    /// A superset of what `poll_transmit` sends, so returning early on `false`
-    /// never withholds a packet. Channel data may still be refused by the
-    /// budget.
-    fn wants_transmit(&self, now: Timestamp) -> bool {
-        (self.pending_probes > 0)
-            || matches!(self.lifecycle, Lifecycle::Closing { .. })
-            || R::control_pending(self)
-            || self.ack_due(now)
-            || ((self.lifecycle == Lifecycle::Open) && self.channels.has_unsent())
-    }
-
     /// An acknowledgement is owed and has been held as long as it may be.
     #[inline]
     fn ack_due(&self, now: Timestamp) -> bool {
         self.ack_pending
-            .is_some_and(|since| now >= since.saturating_add(self.ack_delay))
+            .is_some_and(|since| self.ack_immediately || now >= since.saturating_add(self.ack_delay))
+    }
+
+    /// When the acknowledgement owed, if any, must go out however little else
+    /// there is to carry it.
+    #[inline]
+    fn ack_deadline(&self) -> Option<Timestamp> {
+        let since = self.ack_pending?;
+        Some(if self.ack_immediately { Timestamp::ZERO } else { since.saturating_add(self.ack_delay) })
     }
 
     fn build_header(&self, now: Timestamp, sequence: Sequence) -> Header {
@@ -644,8 +637,8 @@ impl<R: Role> Connection<R> {
         if let Some(at) = self.delivery.next_timeout() {
             earliest = earliest.min(at);
         }
-        if let Some(since) = self.ack_pending {
-            earliest = earliest.min(since.saturating_add(self.ack_delay));
+        if let Some(at) = self.ack_deadline() {
+            earliest = earliest.min(at);
         }
 
         // Queued data waiting on the budget. Only an open connection writes
@@ -705,10 +698,6 @@ impl Role for Client {
             // here.
             _ => Err(ReadError::OutOfRange),
         }
-    }
-
-    fn control_pending(conn: &Connection<Self>) -> bool {
-        conn.role.pending_path_response.is_some()
     }
 
     fn write_control(conn: &mut Connection<Self>, w: &mut BitWriter) -> bool {
@@ -800,10 +789,6 @@ impl Role for Server {
             // Only a client receives these; Ping and Close never reach here.
             _ => Err(ReadError::OutOfRange),
         }
-    }
-
-    fn control_pending(conn: &Connection<Self>) -> bool {
-        conn.role.pending_accept || conn.role.pending_path_challenge.is_some()
     }
 
     fn write_control(conn: &mut Connection<Self>, w: &mut BitWriter) -> bool {

@@ -77,6 +77,10 @@ pub struct Decrypted {
     pub header: Header,
     /// Byte range of the plaintext body within the caller's buffer.
     pub body: Range<usize>,
+    /// Whether this packet is the one after the newest authenticated so far.
+    /// False means a gap, a reordering, or a duplicate: the peer is missing
+    /// packets or we are, and it needs to hear so without delay.
+    pub in_order: bool,
 }
 
 /// Holds both ciphers, the send counter, and the two receive windows.
@@ -160,6 +164,7 @@ impl PacketCrypto {
 
         let sequence = Sequence::resolve(self.replay.newest(), header.sequence).ok_or(DecryptError::Malformed)?;
         self.replay.check(sequence).map_err(DecryptError::Replay)?;
+        let in_order = self.replay.newest().is_none_or(|newest| sequence == newest.next());
 
         let body_len = self
             .rx
@@ -172,6 +177,7 @@ impl PacketCrypto {
             sequence,
             header,
             body: (header_len..(header_len + body_len)).into(),
+            in_order,
         })
     }
 

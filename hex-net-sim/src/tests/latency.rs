@@ -159,3 +159,32 @@ fn an_acknowledgement_with_nothing_to_carry_it_goes_alone_at_its_deadline() {
     assert_eq!(sent.len(), before + 1, "the acknowledgement went out alone");
     assert!(sent[before].header().expect("a payload header").ack.is_some());
 }
+
+#[test]
+fn a_gap_in_the_peers_packets_is_acknowledged_at_once() {
+    let mut pair = deferring_pair();
+
+    // One packet arrives, so the server has a sequence to judge the next
+    // against.
+    pair.client_send(0, b"first");
+    pair.pass();
+    pair.pass();
+
+    // The packet carrying this never arrives, so the one after it leaves a gap.
+    pair.silence_client(true);
+    pair.client_send(0, b"lost");
+    pair.pass();
+    pair.pass();
+    pair.silence_client(false);
+
+    let before = from_server(&pair).len();
+    pair.client_send(0, b"next");
+    pair.pass();
+    pair.pass();
+
+    assert_eq!(
+        from_server(&pair).len(),
+        before + 1,
+        "the gap was reported without waiting out the delay"
+    );
+}

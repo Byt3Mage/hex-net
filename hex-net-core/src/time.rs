@@ -53,7 +53,7 @@ impl Timestamp {
 
     #[inline]
     pub fn saturating_sub(self, d: Duration) -> Timestamp {
-        self.checked_sub(d).unwrap_or(Timestamp::ZERO)
+        self.checked_sub(d).unwrap_or(Timestamp::MAX)
     }
 }
 

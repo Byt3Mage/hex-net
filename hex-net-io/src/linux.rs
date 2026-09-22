@@ -218,7 +218,7 @@ impl Socket for LinuxSocket {
                     continue;
                 }
                 let Some(from) = decode_name(&self.names[index], header.msg_namelen as usize) else { continue };
-                let control = &self.controls[index].0[..(header.msg_controllen as usize).min(CONTROL_LEN)];
+                let control = &self.controls[index].0[..header.msg_controllen.min(CONTROL_LEN)];
                 let at = arrival(control, now, wall);
 
                 // A skipped datagram leaves a gap; later ones move down so that
@@ -622,7 +622,15 @@ fn decode_name(name: &Name, len: usize) -> Option<SocketAddr> {
 /// counts as arriving now.
 fn arrival(control: &[u8], now: Timestamp, wall: SystemTime) -> Timestamp {
     match kernel_stamp(control) {
-        Some(stamp) => now.saturating_sub(wall.duration_since(stamp).unwrap_or(Duration::ZERO)),
+        // A stamp from before the monotonic clock's origin, or a wall clock
+        // that has stepped, leaves the datagram older than the clock can
+        // express. Reading it as now costs one scheduling delay in an RTT
+        // sample; reading it as an underflow would put arrival in the far
+        // future and stop the connection ever timing out.
+        Some(stamp) => {
+            let age = wall.duration_since(stamp).unwrap_or(Duration::ZERO);
+            now.checked_sub(age).unwrap_or(now)
+        }
         None => now,
     }
 }
