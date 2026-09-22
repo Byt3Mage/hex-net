@@ -238,6 +238,9 @@ pub enum Violation {
         lost: u64,
         in_flight: u64,
     },
+    /// A client's stream was recorded by more than one server shard, so its
+    /// connection moved between them.
+    Split { client: usize, shards: Vec<usize> },
     /// A connection ended when the scenario expected none to.
     Ended(Ending),
     /// A client did not finish connected.
@@ -260,6 +263,7 @@ impl fmt::Display for Violation {
                 f,
                 "{who}: {tracked} packets tracked, {acked} acked, {lost} lost, {in_flight} in flight"
             ),
+            Violation::Split { client, shards } => write!(f, "client {client}: recorded by shards {shards:?}"),
             Violation::Ended(ending) => write!(f, "a connection ended: {ending:?}"),
             Violation::NotConnected { client, state } => write!(f, "client {client} ended in state {state:?}"),
         }
@@ -280,26 +284,96 @@ impl fmt::Debug for Sample<'_> {
     }
 }
 
+/// One server shard of a settled run: its endpoint, the app it ran, and its
+/// driver's counters. An unsharded server is a run with one.
+pub struct ServerView<'a> {
+    pub app: &'a Echo,
+    pub endpoint: &'a Endpoint,
+    pub counters: &'a Counters,
+}
+
+/// One client of a settled run.
+pub struct ClientView<'a> {
+    pub app: &'a Chatter,
+    pub connector: &'a Connector,
+    pub counters: &'a Counters,
+}
+
+/// What `check` reads from a run, whatever network carried it: the
+/// simulator's `World`, or real sockets.
+pub trait Settled {
+    fn server_count(&self) -> usize;
+    fn server_view(&self, shard: usize) -> ServerView<'_>;
+    fn client_count(&self) -> usize;
+    fn client_view(&self, index: usize) -> ClientView<'_>;
+    /// Enough to reproduce the run, printed with its violations.
+    fn provenance(&self) -> String;
+}
+
+impl Settled for World<Echo, Chatter> {
+    fn server_count(&self) -> usize {
+        1
+    }
+
+    fn server_view(&self, _shard: usize) -> ServerView<'_> {
+        ServerView {
+            app: self.server_app(),
+            endpoint: self.server().endpoint(),
+            counters: self.server().counters(),
+        }
+    }
+
+    fn client_count(&self) -> usize {
+        self.clients()
+    }
+
+    fn client_view(&self, index: usize) -> ClientView<'_> {
+        ClientView {
+            app: self.client_app(index),
+            connector: self.client(index).connector(),
+            counters: self.client(index).counters(),
+        }
+    }
+
+    fn provenance(&self) -> String {
+        format!("seed {}", self.seed())
+    }
+}
+
 /// Everything a settled run of this workload must satisfy.
 ///
 /// Call once traffic has drained: it requires every message to have completed
 /// its round trip. `total` is how many each client was told to send.
-pub fn check(world: &World<Echo, Chatter>, total: u32) -> Vec<Violation> {
+pub fn check(run: &impl Settled, total: u32) -> Vec<Violation> {
     let mut violations = Vec::new();
+    let servers: Vec<ServerView<'_>> = (0..run.server_count()).map(|shard| run.server_view(shard)).collect();
 
-    for ending in &world.server_app().endings {
-        violations.push(Violation::Ended(*ending));
+    for server in &servers {
+        for ending in &server.app.endings {
+            violations.push(Violation::Ended(*ending));
+        }
     }
 
-    for index in 0..world.clients() {
+    for index in 0..run.client_count() {
         let id = u32::try_from(index).expect("client index fits");
-        let app = world.client_app(index);
-        let state = world.client(index).connector().state();
+        let client = run.client_view(index);
+        let state = client.connector.state();
         if state != State::Connected {
             violations.push(Violation::NotConnected { client: index, state });
         }
 
-        let received = world.server_app().received.get(&id).cloned().unwrap_or_default();
+        // A connection lives on one shard for its whole life, so its stream
+        // must be recorded by exactly one.
+        let holders: Vec<usize> = (0..servers.len())
+            .filter(|&shard| servers[shard].app.received.contains_key(&id))
+            .collect();
+        if holders.len() > 1 {
+            violations.push(Violation::Split { client: index, shards: holders.clone() });
+        }
+        let received = holders
+            .first()
+            .and_then(|&shard| servers[shard].app.received.get(&id).cloned())
+            .unwrap_or_default();
         if !is_exactly(&received, total) {
             violations.push(Violation::Stream {
                 client: index,
@@ -308,46 +382,43 @@ pub fn check(world: &World<Echo, Chatter>, total: u32) -> Vec<Violation> {
                 got: received,
             });
         }
-        if !is_exactly(&app.echoes, total) {
+        if !is_exactly(&client.app.echoes, total) {
             violations.push(Violation::Stream {
                 client: index,
                 at: "the echoes",
                 expected: total,
-                got: app.echoes.clone(),
+                got: client.app.echoes.clone(),
             });
         }
 
-        if let Some(connection) = world.client(index).connector().connection() {
+        if let Some(connection) = client.connector.connection() {
             let messages = connection.pending_messages();
             if messages > 0 {
                 violations.push(Violation::Pending { who: format!("client {index}"), messages });
             }
             reconcile(
                 format!("client {index}"),
-                world.client(index).counters(),
+                client.counters,
                 u64::from(connection.packets_in_flight()),
                 &mut violations,
             );
         }
     }
 
-    let mut server_in_flight = 0u64;
-    for connection in world.server().endpoint().connections() {
-        let messages = connection.pending_messages();
-        if messages > 0 {
-            violations.push(Violation::Pending {
-                who: format!("server connection {}", connection.id().0),
-                messages,
-            });
+    for (shard, server) in servers.iter().enumerate() {
+        let mut in_flight = 0u64;
+        for connection in server.endpoint.connections() {
+            let messages = connection.pending_messages();
+            if messages > 0 {
+                violations.push(Violation::Pending {
+                    who: format!("server {shard} connection {}", connection.id().0),
+                    messages,
+                });
+            }
+            in_flight += u64::from(connection.packets_in_flight());
         }
-        server_in_flight += u64::from(connection.packets_in_flight());
+        reconcile(format!("server {shard}"), server.counters, in_flight, &mut violations);
     }
-    reconcile(
-        "the server".to_string(),
-        world.server().counters(),
-        server_in_flight,
-        &mut violations,
-    );
 
     violations
 }
@@ -368,16 +439,16 @@ fn reconcile(who: String, counters: &Counters, in_flight: u64, violations: &mut 
     }
 }
 
-/// Panics with every violation, and the seed to replay.
-pub fn assert_clean(world: &World<Echo, Chatter>, total: u32) {
-    let violations = check(world, total);
+/// Panics with every violation, and what is needed to replay the run.
+pub fn assert_clean(run: &impl Settled, total: u32) {
+    let violations = check(run, total);
     if violations.is_empty() {
         return;
     }
     let report: Vec<String> = violations.iter().map(Violation::to_string).collect();
     panic!(
-        "seed {}, {} violations:\n  {}",
-        world.seed(),
+        "{}, {} violations:\n  {}",
+        run.provenance(),
         report.len(),
         report.join("\n  ")
     );

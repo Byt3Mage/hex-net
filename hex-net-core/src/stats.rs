@@ -19,6 +19,7 @@ pub enum Counter {
     PacketsDuplicate,
     PacketsTooOld,
     PacketsUnknownConnection,
+    PacketsMisrouted,
     DecryptFailures,
 
     PacketsAcked,
@@ -60,6 +61,7 @@ impl Counter {
             PacketsDuplicate,
             PacketsTooOld,
             PacketsUnknownConnection,
+            PacketsMisrouted,
             DecryptFailures,
             PacketsAcked,
             PacketsLost,
@@ -88,6 +90,7 @@ impl Counter {
             PacketsDuplicate => "packets_duplicate",
             PacketsTooOld => "packets_too_old",
             PacketsUnknownConnection => "packets_unknown_connection",
+            PacketsMisrouted => "packets_misrouted",
             DecryptFailures => "decrypt_failures",
             PacketsAcked => "packets_acked",
             PacketsLost => "packets_lost",

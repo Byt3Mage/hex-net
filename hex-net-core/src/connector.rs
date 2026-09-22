@@ -14,7 +14,10 @@ use crate::{
     packet::Packet,
     stats::Counter,
     time::Timestamp,
-    wire::{ClientNonce, HANDSHAKE_LEN, Header, PacketKind, encode_handshake, encode_request, handshake_blob},
+    wire::{
+        ClientNonce, HANDSHAKE_LEN, Header, PacketKind, ServerNonce, challenge_nonce, encode_handshake, encode_request,
+        handshake_blob,
+    },
 };
 
 /// Handshake steps are resent on this interval until answered.
@@ -53,6 +56,13 @@ pub enum Action {
     Ended,
 }
 
+/// A challenge as the client keeps it: the cookie to echo, and the server's
+/// nonce, which the keys are derived from once the server accepts.
+struct Challenge {
+    cookie: FixedVec<u8, MAX_BLOB>,
+    server_nonce: ServerNonce,
+}
+
 /// A client has one socket and one peer, so it owns a single connection.
 pub struct Connector {
     server: SocketAddr,
@@ -61,7 +71,7 @@ pub struct Connector {
     /// The encrypted ticket being presented, kept so it can be resent.
     ticket: FixedVec<u8, MAX_BLOB>,
     /// The cookie from the challenge, echoed until the server accepts it.
-    cookie: Option<FixedVec<u8, MAX_BLOB>>,
+    challenge: Option<Challenge>,
     /// Drawn once for this attempt and sent with every request, retries
     /// included, so every cookie the server issues for it seals the same one.
     nonce: ClientNonce,
@@ -100,7 +110,7 @@ impl Connector {
             server,
             state: State::Requesting,
             ticket,
-            cookie: None,
+            challenge: None,
             nonce: ClientNonce::random(),
             keys,
             channels,
@@ -174,14 +184,14 @@ impl Connector {
             ctx.counters.inc(Counter::PacketsMalformed);
             return Action::Done;
         };
-        let Some(cookie) = FixedVec::from_slice(blob) else {
+        let (Some(cookie), Some(server_nonce)) = (FixedVec::from_slice(blob), challenge_nonce(&buf[..len])) else {
             ctx.counters.inc(Counter::PacketsMalformed);
             return Action::Done;
         };
 
         // The cookie is opaque, encrypted with a key only the server holds. It is
         // echoed unchanged to prove this address receives.
-        self.cookie = Some(cookie);
+        self.challenge = Some(Challenge { cookie, server_nonce });
         self.state = State::Responding;
         self.last_attempt = Some(ctx.now);
 
@@ -199,7 +209,11 @@ impl Connector {
             return Action::Done;
         };
 
-        let keys = self.keys.for_connection(header.conn_id, self.nonce);
+        // Only a client that answered a challenge is in this state.
+        let Some(challenge) = &self.challenge else { return Action::Done };
+        let keys = self
+            .keys
+            .for_connection(header.conn_id, self.nonce, challenge.server_nonce);
         let mut conn = Connection::connect(ctx.now, header.conn_id, self.server, &keys, self.channels, self.budget);
 
         // Verified by decrypting: a forged acceptance cannot authenticate, and
@@ -266,7 +280,7 @@ impl Connector {
     fn write_handshake(&self, out: &mut Packet) -> Option<usize> {
         match self.state {
             State::Requesting => encode_request(&self.ticket, self.nonce, out).ok(),
-            State::Responding => encode_handshake(PacketKind::Response, self.cookie.as_ref()?, out).ok(),
+            State::Responding => encode_handshake(PacketKind::Response, &self.challenge.as_ref()?.cookie, out).ok(),
             _ => None,
         }
     }

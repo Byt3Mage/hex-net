@@ -69,8 +69,8 @@ impl<T> fmt::Debug for Handle<T> {
 struct Slot {
     /// Odd while occupied, even while free. Incremented on every transition.
     generation: u32,
-    /// Occupied: position in `items`. Free: next free slot, or NONE.
-    value: u32,
+    /// Occupied: index in `items`. Free: next free slot, or NONE.
+    index_or_free: u32,
 }
 
 /// Fixed-capacity storage: items stay contiguous for iteration, handles stay
@@ -99,25 +99,48 @@ impl<T> Slab<T> {
 
     /// Returns the item back when full. Never reallocates.
     pub fn insert(&mut self, item: T) -> Result<Handle<T>, T> {
-        let index = if self.free_head != NONE {
-            let index = self.free_head;
-            self.free_head = self.slots[index as usize].value;
-            index
-        } else if (self.slots.len() as u32) < self.capacity {
-            self.slots.push(Slot { generation: 0, value: NONE });
-            (self.slots.len() - 1) as u32
-        } else {
-            return Err(item);
-        };
+        match self.claim() {
+            Some(index) => Ok(self.fill(index, item)),
+            None => Err(item),
+        }
+    }
 
+    /// Inserts the item `make` builds, handing it the handle it will have, so
+    /// an item can carry something derived from its own handle. `make` is not
+    /// called when the slab is full. Never reallocates.
+    pub fn insert_with(&mut self, make: impl FnOnce(Handle<T>) -> T) -> Option<Handle<T>> {
+        let index = self.claim()?;
+        // A claimed slot is free, so its generation is even; occupying it
+        // makes it the next, odd, one.
+        let handle = Handle::new(index, self.slots[index as usize].generation.wrapping_add(1));
+        Some(self.fill(index, make(handle)))
+    }
+
+    /// Takes a free slot off the free list, or a fresh one while under
+    /// capacity. The slot is not occupied until `fill`.
+    fn claim(&mut self) -> Option<u32> {
+        if self.free_head != NONE {
+            let index = self.free_head;
+            self.free_head = self.slots[index as usize].index_or_free;
+            Some(index)
+        } else if (self.slots.len() as u32) < self.capacity {
+            self.slots.push(Slot { generation: 0, index_or_free: NONE });
+            Some((self.slots.len() - 1) as u32)
+        } else {
+            None
+        }
+    }
+
+    /// Occupies a slot `claim` returned.
+    fn fill(&mut self, index: u32, item: T) -> Handle<T> {
         let dense = self.items.len() as u32;
         self.items.push(item);
         self.owners.push(index);
 
         let slot = &mut self.slots[index as usize];
         slot.generation = slot.generation.wrapping_add(1);
-        slot.value = dense;
-        Ok(Handle::new(index, slot.generation))
+        slot.index_or_free = dense;
+        Handle::new(index, slot.generation)
     }
 
     pub fn remove(&mut self, handle: Handle<T>) -> Option<T> {
@@ -129,13 +152,13 @@ impl<T> Slab<T> {
         // position.
         if dense < self.items.len() {
             let moved = self.owners[dense];
-            self.slots[moved as usize].value = dense as u32;
+            self.slots[moved as usize].index_or_free = dense as u32;
         }
 
         let slot = &mut self.slots[handle.index as usize];
         slot.generation = slot.generation.wrapping_add(1);
         if slot.generation != 0 {
-            slot.value = self.free_head;
+            slot.index_or_free = self.free_head;
             self.free_head = handle.index;
         }
         // A generation that wrapped to zero retires the slot permanently: a
@@ -146,7 +169,14 @@ impl<T> Slab<T> {
     #[inline]
     fn dense_index(&self, handle: Handle<T>) -> Option<usize> {
         let slot = self.slots.get(handle.index as usize)?;
-        (slot.generation == handle.generation).then_some(slot.value as usize)
+        (slot.generation == handle.generation).then_some(slot.index_or_free as usize)
+    }
+
+    /// The handle of whatever occupies slot `index`, if anything does.
+    #[inline]
+    pub fn handle_at(&self, index: u32) -> Option<Handle<T>> {
+        let slot = self.slots.get(index as usize)?;
+        ((slot.generation & 1) == 1).then_some(Handle::new(index, slot.generation))
     }
 
     #[inline]

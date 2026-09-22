@@ -6,3 +6,4 @@ members = ["hex-net-core", "hex-net-io", "hex-net-sim"]
 [workspace.dependencies]
 hex-net-core = { path = "hex-net-core" }
 hex-net-io = { path = "hex-net-io" }
+hex-net-sim = {path = "hex-net-sim"}

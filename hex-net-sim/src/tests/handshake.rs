@@ -9,8 +9,9 @@ use hex_net_core::{
         Acceptor, HandshakeError, MAX_USER_DATA, RESUME_GRACE, SessionId, Ticket, TicketId, UserData, encrypt_ticket,
     },
     packet::Packet,
+    shard::ShardId,
     time::Timestamp,
-    wire::{ClientNonce, HANDSHAKE_LEN, MAX_DATAGRAM, PacketKind, encode_handshake},
+    wire::{ClientNonce, HANDSHAKE_LEN, MAX_DATAGRAM, PacketKind, ServerNonce, encode_handshake},
 };
 
 use crate::pair::{Pair, session_keys};
@@ -150,7 +151,7 @@ fn a_cookie_binds_the_address_that_presented_the_ticket() {
     let ticket = Ticket {
         expires_at: now.saturating_add(Duration::from_secs(60)),
         client_id: 99,
-        session: Some(SessionId(3)),
+        session: Some(SessionId::new(3, ShardId::FIRST)),
         keys: session_keys(99),
         user_data: UserData::new(),
     };
@@ -166,6 +167,7 @@ fn a_cookie_binds_the_address_that_presented_the_ticket() {
                 now,
                 addr,
                 ClientNonce(0x5EED),
+                ServerNonce(0x5E4F),
                 TicketId([0x1D; TicketId::LEN]),
                 &ticket,
                 &mut encrypted,
@@ -179,6 +181,7 @@ fn a_cookie_binds_the_address_that_presented_the_ticket() {
 
         assert_eq!(cookie.addr, addr, "{text}");
         assert_eq!(cookie.nonce, ClientNonce(0x5EED), "{text}");
+        assert_eq!(cookie.server_nonce, ServerNonce(0x5E4F), "{text}");
         assert_eq!(cookie.issued_at, now);
         assert_eq!(cookie.ticket_id, TicketId([0x1D; TicketId::LEN]), "{text}");
         assert_eq!(cookie.ticket.session, ticket.session);
@@ -203,7 +206,7 @@ fn a_cookie_carries_a_full_user_data_payload() {
     let ticket = Ticket {
         expires_at: now.saturating_add(Duration::from_secs(60)),
         client_id: u64::MAX,
-        session: Some(SessionId(u64::MAX)),
+        session: Some(SessionId::new(u64::MAX, ShardId::FIRST)),
         keys: session_keys(5),
         user_data,
     };
@@ -215,6 +218,7 @@ fn a_cookie_carries_a_full_user_data_payload() {
             now,
             addr,
             ClientNonce(0x5EED),
+            ServerNonce(0x5E4F),
             TicketId([0x1D; TicketId::LEN]),
             &ticket,
             &mut encrypted,
@@ -252,6 +256,7 @@ fn a_cookie_from_another_server_is_rejected() {
             now,
             addr,
             ClientNonce(0x5EED),
+            ServerNonce(0x5E4F),
             TicketId([0x1D; TicketId::LEN]),
             &ticket,
             &mut encrypted,
@@ -366,10 +371,16 @@ fn the_handshake_settles_with_one_connection() {
 }
 
 #[test]
-fn every_payload_header_carries_a_connection_id() {
+fn every_payload_header_carries_the_connection_id_the_server_assigned() {
     let mut pair = Pair::new(ORDERED, 1);
     assert!(pair.settle());
 
+    // Zero is a valid id: the first occupancy of the first slot on the first
+    // shard. What matters is that both directions carry the one the server
+    // assigned, since the server routes by it.
+    let assigned = pair.server.connections()[0].id();
+    
+    assert_eq!(pair.client.connection().expect("connected").id(), assigned);
     let payloads: Vec<_> = pair
         .trace
         .iter()
@@ -379,10 +390,7 @@ fn every_payload_header_carries_a_connection_id() {
     assert!(payloads.len() >= 2, "both directions sent one");
     for datagram in payloads {
         let header = datagram.header().expect("payload headers parse");
-        assert_ne!(
-            header.conn_id.0, 0,
-            "the id is half of every nonce, so it is never absent"
-        );
+        assert_eq!(header.conn_id, assigned, "every payload names the assigned connection");
     }
 }
 

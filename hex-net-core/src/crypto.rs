@@ -9,7 +9,7 @@ use chacha20poly1305::{
     aead::{AeadInOut, KeyInit, inout::InOutBuf},
 };
 
-use crate::wire::{ClientNonce, ConnectionId};
+use crate::wire::{ClientNonce, ConnectionId, ServerNonce};
 
 pub const TAG_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
@@ -39,10 +39,10 @@ impl Keys {
     /// again. A packet from any other connection fails authentication rather
     /// than being taken for this one's, and no two connections can ever share
     /// a nonce space.
-    pub fn for_connection(&self, id: ConnectionId, nonce: ClientNonce) -> ConnectionKeys {
+    pub fn for_connection(&self, id: ConnectionId, client: ClientNonce, server: ServerNonce) -> ConnectionKeys {
         ConnectionKeys(Keys {
-            client_to_server: derive(&self.client_to_server, id, nonce),
-            server_to_client: derive(&self.server_to_client, id, nonce),
+            client_to_server: derive(&self.client_to_server, id, client, server),
+            server_to_client: derive(&self.server_to_client, id, client, server),
         })
     }
 }
@@ -64,20 +64,32 @@ impl ConnectionKeys {
     }
 }
 
-/// A subkey: the ChaCha20 keystream under `key` at the nonce `id || nonce`,
-/// which is a pseudorandom function of that nonce.
+/// A subkey, in two steps of the same pseudorandom function: the keystream
+/// under the session key at `id || client`, then the keystream under that at
+/// `server || 0`. A cascade of pseudorandom functions is one, over all three
+/// inputs, and each step's input fits a single nonce.
 ///
-/// Session keys encrypt nothing else, so this nonce space is never shared
-/// with packet encryption, which uses the derived keys.
-fn derive(key: &Key, id: ConnectionId, nonce: ClientNonce) -> Key {
-    let mut iv = [0u8; NONCE_LEN];
-    iv[0..4].copy_from_slice(&id.0.to_le_bytes());
-    iv[4..12].copy_from_slice(&nonce.0.to_le_bytes());
+/// Session keys encrypt nothing else, so their nonce space is never shared
+/// with packet encryption, which uses the derived keys; the intermediate key
+/// is used for this derivation alone.
+fn derive(key: &Key, id: ConnectionId, client: ClientNonce, server: ServerNonce) -> Key {
+    let mut first = [0u8; NONCE_LEN];
+    first[0..4].copy_from_slice(&id.0.to_le_bytes());
+    first[4..12].copy_from_slice(&client.0.to_le_bytes());
 
+    let mut second = [0u8; NONCE_LEN];
+    second[0..8].copy_from_slice(&server.0.to_le_bytes());
+
+    keystream(&keystream(key, &first), &second)
+}
+
+/// The first 32 bytes of the ChaCha20 keystream under `key` at `iv`, which is
+/// a pseudorandom function of `iv`.
+fn keystream(key: &Key, iv: &[u8; NONCE_LEN]) -> Key {
     // Encrypting zeros yields the keystream itself. The tag is not needed.
     let mut subkey: Key = [0u8; 32];
     let _ = ChaCha20Poly1305::new(key.into())
-        .encrypt_inout_detached(&iv.into(), &[], InOutBuf::from(&mut subkey[..]))
+        .encrypt_inout_detached(iv.into(), &[], InOutBuf::from(&mut subkey[..]))
         .expect("32 bytes is far below the cipher's message limit");
     subkey
 }

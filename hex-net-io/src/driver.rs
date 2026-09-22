@@ -24,6 +24,12 @@ use crate::{Received, Socket, Transmit};
 /// Datagrams taken from the socket per call.
 const RECV_BATCH: usize = 32;
 
+/// Batches read in one step before the step moves on to timers and sending.
+/// Under a flood of arrivals, reading until the socket is empty would never
+/// end, and nothing already owed would go out; bounding it leaves the rest for
+/// a step that follows at once.
+const RECV_ROUNDS: usize = 8;
+
 /// Packets built before the socket is called to send them. A packet going to
 /// a path under validation is sent twice, so a flush carries up to twice
 /// this many datagrams.
@@ -205,28 +211,42 @@ impl<S: Socket> ServerDriver<S> {
         &self.socket
     }
 
-    /// Does everything due at `now`: takes every waiting datagram, services
+    #[inline]
+    pub fn socket_mut(&mut self) -> &mut S {
+        &mut self.socket
+    }
+
+    /// Does everything due at `now`: takes the waiting datagrams, services
     /// expired timers, lets the application update, and sends the result.
     ///
     /// Returns when to call again if no datagram arrives first. A time at or
-    /// before `now` means immediately.
+    /// before `now` means immediately, which is also what a step that left
+    /// datagrams unread returns.
+    ///
+    /// A datagram another shard of the group owns is counted and dropped:
+    /// sockets bound as a group are steered by the kernel, so one arrives only
+    /// if it names a connection or cookie no member issued.
     pub fn step(&mut self, now: Timestamp, app: &mut impl ServerApp) -> io::Result<Option<Timestamp>> {
-        self.receive(app)?;
+        let backlog = self.receive(app)?;
 
         let mut ctx = Ctx::new(now, &mut self.counters);
         self.endpoint.handle_timeout(&mut ctx);
-        while let Some(event) = self.endpoint.poll_event() {
-            app.on_event(event);
-        }
+        self.deliver_events(app);
 
         app.update(now, &mut self.endpoint);
         self.transmit(now)?;
 
-        Ok(earliest(self.endpoint.next_timeout(), app.next_wake()))
+        let resume = backlog.then_some(now);
+        Ok(earliest(
+            earliest(self.endpoint.next_timeout(), app.next_wake()),
+            resume,
+        ))
     }
 
-    fn receive(&mut self, app: &mut impl ServerApp) -> io::Result<()> {
-        loop {
+    /// Reads and handles up to `RECV_ROUNDS` batches. Returns whether more
+    /// may be waiting.
+    fn receive(&mut self, app: &mut impl ServerApp) -> io::Result<bool> {
+        for _ in 0..RECV_ROUNDS {
             let count = self.inbox.fill(&mut self.socket)?;
             for index in 0..count {
                 let received = self.inbox.received[index];
@@ -247,9 +267,20 @@ impl<S: Socket> ServerDriver<S> {
                     self.outbox.push(addr, &self.reply[..len]);
                 }
             }
+            self.deliver_events(app);
             if count < RECV_BATCH {
-                return Ok(());
+                return Ok(false);
             }
+        }
+        Ok(true)
+    }
+
+    /// Hands the application every event the endpoint has queued. Called
+    /// after each receive batch and each timeout pass, which is what keeps the
+    /// endpoint's queue within the room it reserved.
+    fn deliver_events(&mut self, app: &mut impl ServerApp) {
+        while let Some(event) = self.endpoint.poll_event() {
+            app.on_event(event);
         }
     }
 
@@ -313,12 +344,17 @@ impl<S: Socket> ClientDriver<S> {
         &self.socket
     }
 
+    #[inline]
+    pub fn socket_mut(&mut self) -> &mut S {
+        &mut self.socket
+    }
+
     /// Does everything due at `now`, as `ServerDriver::step` does.
     ///
     /// Sends at most one packet. A connection builds one per call, and whatever
     /// is left over makes the returned deadline immediate.
     pub fn step(&mut self, now: Timestamp, app: &mut impl ClientApp) -> io::Result<Option<Timestamp>> {
-        self.receive(app)?;
+        let backlog = self.receive(app)?;
 
         let mut ctx = Ctx::new(now, &mut self.counters);
         let _ = self.connector.handle_timeout(&mut ctx);
@@ -330,18 +366,24 @@ impl<S: Socket> ClientDriver<S> {
         if let Some(slot) = self.outbox.next_slot()
             && let Some(len) = self.connector.poll_transmit(&mut ctx, slot)
         {
-            let to = Destinations { primary: self.connector.server(), probe: None };
-            self.outbox.commit(to, len);
+            self.outbox
+                .commit(Destinations { primary: self.connector.server(), probe: None }, len);
         }
         self.outbox.flush(&mut self.socket, &mut self.counters)?;
         self.report(app);
 
-        Ok(earliest(self.connector.next_timeout(), app.next_wake()))
+        let resume = backlog.then_some(now);
+        Ok(earliest(
+            earliest(self.connector.next_timeout(), app.next_wake()),
+            resume,
+        ))
     }
 
-    fn receive(&mut self, app: &mut impl ClientApp) -> io::Result<()> {
+    /// Reads and handles up to `RECV_ROUNDS` batches. Returns whether more
+    /// may be waiting.
+    fn receive(&mut self, app: &mut impl ClientApp) -> io::Result<bool> {
         let server = self.connector.server();
-        loop {
+        for _ in 0..RECV_ROUNDS {
             let count = self.inbox.fill(&mut self.socket)?;
             for index in 0..count {
                 let received = self.inbox.received[index];
@@ -362,9 +404,10 @@ impl<S: Socket> ClientDriver<S> {
                 self.report(app);
             }
             if count < RECV_BATCH {
-                return Ok(());
+                return Ok(false);
             }
         }
+        Ok(true)
     }
 
     fn report(&mut self, app: &mut impl ClientApp) {

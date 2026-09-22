@@ -41,8 +41,19 @@ impl Timestamp {
     }
 
     #[inline]
+    pub fn checked_sub(self, d: Duration) -> Option<Timestamp> {
+        let nanos = u64::try_from(d.as_nanos()).ok()?;
+        self.0.checked_sub(nanos).map(Timestamp)
+    }
+
+    #[inline]
     pub fn saturating_add(self, d: Duration) -> Timestamp {
         self.checked_add(d).unwrap_or(Timestamp::MAX)
+    }
+
+    #[inline]
+    pub fn saturating_sub(self, d: Duration) -> Timestamp {
+        self.checked_sub(d).unwrap_or(Timestamp::MAX)
     }
 }
 
@@ -53,6 +64,7 @@ pub trait Clock {
 }
 
 /// Real monotonic time, measured from construction.
+#[derive(Clone, Copy, Debug)]
 pub struct MonotonicClock {
     origin: Instant,
 }

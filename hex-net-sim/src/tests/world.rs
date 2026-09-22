@@ -147,3 +147,33 @@ fn many_idle_clients_stay_connected_on_keepalives() {
     }
     assert_clean(&world, 0);
 }
+
+/// Arrivals and departures in bulk are each reported once: a crowd that
+/// connects in the same instant, drops together, and lets its sessions lapse
+/// together produces as many events of each kind as there were players.
+#[test]
+fn a_crowd_arriving_and_leaving_together_is_reported_in_full() {
+    const CLIENTS: usize = 200;
+    let mut world = World::new(4, 256, ORDERED, Echo::default());
+    for index in 0..CLIENTS {
+        let link = Link::clean(Duration::from_millis(20));
+        world.add_client(link, link, Chatter::new(index, 0, SEND_INTERVAL));
+    }
+    world.run_for(Duration::from_secs(5)).expect("the run made progress");
+    assert_eq!(world.server().endpoint().num_connections(), CLIENTS);
+    assert_eq!(world.server_app().connected, CLIENTS, "every arrival was reported");
+
+    for index in 0..CLIENTS {
+        world.crash_client(index);
+    }
+    world.run_for(Duration::from_secs(120)).expect("the run made progress");
+
+    let app = world.server_app();
+    assert_eq!(world.server().endpoint().num_connections(), 0);
+    assert_eq!(app.endings.len(), CLIENTS, "every departure was reported");
+    assert!(
+        app.endings.iter().all(|ending| ending.suspended),
+        "a dropped player's session is held"
+    );
+    assert_eq!(app.expired.len(), CLIENTS, "every lapsed session was reported");
+}

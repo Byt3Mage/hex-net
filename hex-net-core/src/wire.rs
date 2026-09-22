@@ -3,6 +3,7 @@
 use crate::{
     bits::{BitReader, BitWriter, ReadError, WriteError},
     seq::WireSequence,
+    shard::{SHARD_BITS, ShardId},
 };
 
 pub use crate::crypto::TAG_LEN;
@@ -21,6 +22,28 @@ pub const PROTOCOL_ID: u64 = 0x_4E45_544C_4942_0001;
 
 /// Offset of the blob inside a handshake packet: kind and length.
 pub const HANDSHAKE_BODY_OFFSET: usize = 3;
+
+/// Chosen at random by the server for each challenge. Carried in the clear
+/// after the cookie, for the client, and sealed inside it, for the server.
+///
+/// Both sides mix it into the connection's keys, so the server alone ensures
+/// no two connections share keys: not a backend issuing the same session keys
+/// twice, a restarted server issuing an id again, nor a client whose generator
+/// repeats its own nonce can make it happen. Tampering with the cleartext copy
+/// only makes the keys the two sides derive disagree, so the handshake fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ServerNonce(pub u64);
+
+impl ServerNonce {
+    pub const LEN: usize = 8;
+
+    /// A fresh nonce from the operating system's generator.
+    pub fn random() -> ServerNonce {
+        let mut bytes = [0u8; Self::LEN];
+        getrandom::fill(&mut bytes).expect("OS randomness unavailable");
+        ServerNonce(u64::from_le_bytes(bytes))
+    }
+}
 
 /// Chosen at random by a client for each connection attempt, and carried by
 /// every request that attempt sends, retries included.
@@ -75,14 +98,92 @@ impl PacketKind {
     }
 }
 
-/// Server-assigned, unique per connection.
+/// Server-assigned, naming one live connection of one endpoint.
 ///
-/// Survives NAT rebinding, and forms half of every AEAD nonce, so it must not
-/// be reused while a session's keys are live.
+/// Survives NAT rebinding. Laid out from the low bits: the issuing shard
+/// (`SHARD_BITS`), the connection's slot on that shard (`SLOT_BITS`), and how
+/// many times that slot has been occupied (`GENERATION_BITS`), so the owning
+/// shard is read from the cleartext header and the slot is found without a
+/// lookup. Travels little-endian, which puts the shard in the header's second
+/// byte.
+///
+/// An id is not unique over time: a slot reused `2^GENERATION_BITS` times, or
+/// a restarted server, issues it again. Nothing depends on it being unique,
+/// because every connection's keys are derived from its own handshake, so a
+/// packet addressed to an earlier holder of the id fails authentication.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConnectionId(pub u32);
 
-mod flags {
+/// Bits of a connection id naming its slot on the issuing shard.
+pub const SLOT_BITS: u32 = 14;
+
+/// Bits of a connection id counting its slot's occupancies.
+pub const GENERATION_BITS: u32 = 32 - SHARD_BITS - SLOT_BITS;
+
+impl ConnectionId {
+    /// Slots one shard can name.
+    pub const SLOTS: u32 = 1 << SLOT_BITS;
+    const SLOT_MASK: u32 = Self::SLOTS - 1;
+    const GENERATION_MASK: u32 = (1 << GENERATION_BITS) - 1;
+
+    /// The id of the connection in `slot` on `shard`, in the slot's
+    /// `generation`-th occupancy. Only the low bits of each that fit are used,
+    /// so a generation that has wrapped still yields a valid id.
+    #[inline]
+    pub const fn new(slot: u32, generation: u32, shard: ShardId) -> ConnectionId {
+        ConnectionId(
+            ((generation & Self::GENERATION_MASK) << (SHARD_BITS + SLOT_BITS))
+                | ((slot & Self::SLOT_MASK) << SHARD_BITS)
+                | (shard.to_byte() as u32),
+        )
+    }
+
+    /// The shard that issued this id and owns its connection.
+    #[inline]
+    pub const fn shard(self) -> ShardId {
+        ShardId::from_byte((self.0 & ((1 << SHARD_BITS) - 1)) as u8)
+    }
+
+    /// The connection's slot on its shard.
+    #[inline]
+    pub const fn slot(self) -> u32 {
+        (self.0 >> SHARD_BITS) & Self::SLOT_MASK
+    }
+
+    /// Which occupancy of the slot this id belongs to, modulo
+    /// `2^GENERATION_BITS`.
+    #[inline]
+    pub const fn generation(self) -> u32 {
+        self.0 >> (SHARD_BITS + SLOT_BITS)
+    }
+}
+
+/// Where a payload header keeps the connection id's low byte, which is its
+/// shard.
+pub const SHARD_OFFSET: usize = 1;
+
+/// The shortest payload packet: flags, connection id, and sequence.
+pub const MIN_PAYLOAD_HEADER: usize = 7;
+
+/// The shard a datagram must be handled by, read from cleartext alone, or
+/// `None` when any shard may handle it.
+///
+/// A payload packet belongs to the shard in its connection id. A challenge
+/// response belongs to the shard named by the first byte of its cookie. A
+/// request may be answered anywhere. The kernel steers datagrams by the same
+/// rule, so a shard receiving one whose owner is another shard means steering
+/// is absent or the datagram names a shard nobody runs.
+pub fn owner_shard(packet: &[u8]) -> Option<ShardId> {
+    match PacketKind::from_byte(*packet.first()?)? {
+        PacketKind::Payload if packet.len() >= MIN_PAYLOAD_HEADER => Some(ShardId::from_byte(packet[SHARD_OFFSET])),
+        PacketKind::Response if packet.len() >= HANDSHAKE_LEN => {
+            handshake_blob(packet)?.first().map(|&byte| ShardId::from_byte(byte))
+        }
+        _ => None,
+    }
+}
+
+pub mod flags {
     pub const KIND_MASK: u8 = 0b0000_0011;
     pub const ACK: u8 = 0b0000_0100;
     pub const ACK_BITS: u8 = 0b000_1000;
@@ -213,20 +314,48 @@ pub fn handshake_blob(packet: &[u8]) -> Option<&[u8]> {
 /// two sides derive disagree, so the handshake fails. It cannot make either
 /// side accept a connection it did not ask for.
 pub fn encode_request(ticket: &[u8], nonce: ClientNonce, out: &mut [u8]) -> Result<usize, WriteError> {
-    let at = HANDSHAKE_BODY_OFFSET + ticket.len();
-    if (at + ClientNonce::LEN) > HANDSHAKE_LEN {
-        return Err(WriteError::Overflow);
-    }
-    let len = encode_handshake(PacketKind::Request, ticket, out)?;
-    out[at..at + ClientNonce::LEN].copy_from_slice(&nonce.0.to_le_bytes());
-    Ok(len)
+    encode_with_trailer(PacketKind::Request, ticket, nonce.0.to_le_bytes(), out)
 }
 
 /// The nonce a request carries after its ticket.
 pub fn request_nonce(packet: &[u8]) -> Option<ClientNonce> {
+    trailer(packet).map(|bytes| ClientNonce(u64::from_le_bytes(bytes)))
+}
+
+/// Frames a challenge (cookie, the server's nonce, padding).
+pub fn encode_challenge(cookie: &[u8], nonce: ServerNonce, out: &mut [u8]) -> Result<usize, WriteError> {
+    encode_with_trailer(PacketKind::Challenge, cookie, nonce.0.to_le_bytes(), out)
+}
+
+/// The nonce a challenge carries after its cookie.
+pub fn challenge_nonce(packet: &[u8]) -> Option<ServerNonce> {
+    trailer(packet).map(|bytes| ServerNonce(u64::from_le_bytes(bytes)))
+}
+
+/// What a request or challenge carries after its blob: one side's nonce.
+const TRAILER_LEN: usize = 8;
+const _: () = assert!(ClientNonce::LEN == TRAILER_LEN && ServerNonce::LEN == TRAILER_LEN);
+
+/// A handshake packet whose blob is followed by a nonce.
+fn encode_with_trailer(
+    kind: PacketKind,
+    blob: &[u8],
+    tail: [u8; TRAILER_LEN],
+    out: &mut [u8],
+) -> Result<usize, WriteError> {
+    let at = HANDSHAKE_BODY_OFFSET + blob.len();
+    if (at + TRAILER_LEN) > HANDSHAKE_LEN {
+        return Err(WriteError::Overflow);
+    }
+    let len = encode_handshake(kind, blob, out)?;
+    out[at..at + TRAILER_LEN].copy_from_slice(&tail);
+    Ok(len)
+}
+
+/// The nonce after a handshake packet's blob.
+fn trailer(packet: &[u8]) -> Option<[u8; TRAILER_LEN]> {
     let at = HANDSHAKE_BODY_OFFSET + handshake_blob(packet)?.len();
-    let bytes = packet.get(at..(at + ClientNonce::LEN))?;
-    Some(ClientNonce(u64::from_le_bytes(bytes.try_into().ok()?)))
+    packet.get(at..(at + TRAILER_LEN))?.try_into().ok()
 }
 
 #[inline]

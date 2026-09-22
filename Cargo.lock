@@ -148,6 +148,8 @@ name = "hex-net-io"
 version = "0.1.0"
 dependencies = [
  "hex-net-core",
+ "hex-net-sim",
+ "libc",
 ]
 
 [[package]]

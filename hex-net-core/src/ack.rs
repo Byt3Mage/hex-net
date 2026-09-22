@@ -298,6 +298,9 @@ impl<P, const N: usize> Delivery<P, N> {
             if let Some((_, evicted)) = self.sent.insert(sequence, sent)
                 && let State::InFlight(record) = evicted.state
             {
+                // Resolved here as lost rather than by detection, so it leaves
+                // the flight here too.
+                self.in_flight -= 1;
                 notify(Resolved::Lost(record));
             }
         }

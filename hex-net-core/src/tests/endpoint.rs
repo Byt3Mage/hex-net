@@ -2,13 +2,15 @@
 
 use std::net::SocketAddr;
 
-use crate::channel::{ChannelKind, ChannelSet};
-use crate::ctx::Ctx;
-use crate::endpoint::{Action, DropReason, Endpoint, EndpointConfig};
-use crate::packet::Packet;
-use crate::stats::Counters;
-use crate::time::Timestamp;
-use crate::wire::{HANDSHAKE_LEN, MAX_DATAGRAM, PacketKind};
+use crate::{
+    channel::{ChannelKind, ChannelSet},
+    ctx::Ctx,
+    endpoint::{Action, DropReason, Endpoint, EndpointConfig},
+    packet::Packet,
+    stats::Counters,
+    time::Timestamp,
+    wire::{HANDSHAKE_LEN, MAX_DATAGRAM, PacketKind},
+};
 
 const CHANNELS: ChannelSet = ChannelSet::new([ChannelKind::ReliableOrdered]);
 

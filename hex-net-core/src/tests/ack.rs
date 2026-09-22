@@ -2,9 +2,11 @@
 
 use std::time::Duration;
 
-use crate::ack::{Delivery, MAX_ACK_DELAY, Outgoing, Resolved, decode_ack_delay, encode_ack_delay};
-use crate::seq::Sequence;
-use crate::time::Timestamp;
+use crate::{
+    ack::{Delivery, MAX_ACK_DELAY, Outgoing, Resolved, decode_ack_delay, encode_ack_delay},
+    seq::Sequence,
+    time::Timestamp,
+};
 
 fn seq(n: u64) -> Sequence {
     Sequence::new(n).expect("nonzero literal")
@@ -135,6 +137,9 @@ fn a_record_displaced_from_its_slot_is_reported_lost() {
     // The ring holds eight; the ninth tracked packet takes packet 1's slot.
     ledger.send(at(0), 9);
     assert_eq!(ledger.take(), vec![Resolved::Lost(1)]);
+    // Resolved, so it has left the flight: every packet sent is either
+    // resolved or in flight, never both.
+    assert_eq!(ledger.delivery.in_flight(), 8);
 }
 
 #[test]

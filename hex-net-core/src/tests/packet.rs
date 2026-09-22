@@ -1,9 +1,11 @@
 //! What the outgoing header reports about received traffic.
 
-use crate::packet::PacketCrypto;
-use crate::seq::Sequence;
-use crate::time::Timestamp;
-use crate::wire::ConnectionId;
+use crate::{
+    packet::PacketCrypto,
+    seq::Sequence,
+    time::Timestamp,
+    wire::{ConnectionId, ServerNonce},
+};
 
 fn seq(n: u64) -> Sequence {
     Sequence::new(n).expect("nonzero literal")
@@ -44,18 +46,21 @@ fn every_connection_and_every_attempt_gets_its_own_keys() {
         client_to_server: [7; 32],
         server_to_client: [9; 32],
     };
-    let base = session.for_connection(ConnectionId(1), ClientNonce(1));
+    let base = session.for_connection(ConnectionId(1), ClientNonce(1), ServerNonce(1));
 
     // The same inputs derive the same keys on both sides of a handshake.
-    let again = session.for_connection(ConnectionId(1), ClientNonce(1));
+    let again = session.for_connection(ConnectionId(1), ClientNonce(1), ServerNonce(1));
     assert_eq!(base.client_to_server(), again.client_to_server());
     assert_eq!(base.server_to_client(), again.server_to_client());
 
-    // A different connection, or a different attempt with the same session
-    // keys, derives something else entirely.
-    let other_id = session.for_connection(ConnectionId(2), ClientNonce(1));
-    let other_attempt = session.for_connection(ConnectionId(1), ClientNonce(2));
-    for derived in [other_id, other_attempt] {
+    // A different connection, a different attempt, or a different challenge
+    // with the same session keys derives something else entirely. The last is
+    // the server's own guarantee: it holds when the id and the client's nonce
+    // both repeat.
+    let other_id = session.for_connection(ConnectionId(2), ClientNonce(1), ServerNonce(1));
+    let other_attempt = session.for_connection(ConnectionId(1), ClientNonce(2), ServerNonce(1));
+    let other_challenge = session.for_connection(ConnectionId(1), ClientNonce(1), ServerNonce(2));
+    for derived in [other_id, other_attempt, other_challenge] {
         assert_ne!(base.client_to_server(), derived.client_to_server());
         assert_ne!(base.server_to_client(), derived.server_to_client());
     }

@@ -1,11 +1,13 @@
 //! The server's front door: routing, handshakes, and session lifetime.
 
-use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap, VecDeque};
-use std::hash::{BuildHasher, RandomState};
-use std::marker::PhantomData;
-use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, VecDeque},
+    hash::{BuildHasher, RandomState},
+    marker::PhantomData,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use crate::{
     budget::BudgetConfig,
@@ -13,15 +15,18 @@ use crate::{
     connection::{CloseReason, Connection, Event as ConnEvent, RecvError, Server},
     crypto::{Key, MAX_BLOB},
     ctx::Ctx,
-    fixed::RingQueue,
     handshake::{
         Acceptor, COOKIE_LIFETIME, EncryptedTicket, HandshakeError, RESUME_GRACE, SessionId, Ticket, TicketId,
     },
     packet::Packet,
+    shard::{Shard, ShardId},
     slab::{Handle, Slab},
     stats::Counter,
     time::Timestamp,
-    wire::{ConnectionId, HANDSHAKE_LEN, Header, PacketKind, encode_handshake, request_nonce},
+    timer::TimerHeap,
+    wire::{
+        ConnectionId, HANDSHAKE_LEN, Header, PacketKind, ServerNonce, encode_challenge, owner_shard, request_nonce,
+    },
 };
 
 #[inline(always)]
@@ -66,24 +71,37 @@ impl RefillPolicy for GlobalResponses {
 /// inside one tick.
 const REAP_BATCH: usize = 64;
 
+/// The most connections one endpoint holds: one per slot a connection id can
+/// name.
+pub const MAX_CONNECTIONS: u32 = ConnectionId::SLOTS;
+
 /// Deployment parameters. The only things in the transport that scale with
 /// connection count.
 #[derive(Clone, Copy, Debug)]
 pub struct EndpointConfig {
+    /// Clamped to [MAX_CONNECTIONS].
     pub capacity: u32,
     /// Rate-limiter slots. Direct-mapped, under a keyed hash, so distinct
-    /// addresses occasionally share a bucked. Oversizing relative to
+    /// addresses occasionally share a bucket. Oversizing relative to
     /// `capacity` makes that rare, and a shared bucket only throttles.
     pub limiter_slots: usize,
     pub budget: BudgetConfig,
+    /// Which member of its group this endpoint is. An endpoint alone on its
+    /// address is the only member of a group of one.
+    pub shard: Shard,
 }
 
 impl EndpointConfig {
     pub fn new(capacity: u32) -> Self {
+        Self::sharded(capacity, Shard::solo())
+    }
+
+    pub fn sharded(capacity: u32, shard: Shard) -> Self {
         Self {
             capacity,
             limiter_slots: ((capacity as usize) * 8).next_power_of_two().max(1024),
             budget: BudgetConfig::DEFAULT,
+            shard,
         }
     }
 }
@@ -107,6 +125,10 @@ pub enum Action {
     },
     Routed(Handle<ServerConnection>),
     Connected(Handle<ServerConnection>),
+    /// Belongs to another shard of this endpoint's group. Handled by nothing
+    /// here: whoever delivered it may pass `buf[..len]` on to that shard,
+    /// with the same source address and arrival time.
+    Forward(ShardId),
     Dropped(DropReason),
 }
 
@@ -118,6 +140,7 @@ pub enum DropReason {
     RateLimited,
     Handshake(HandshakeError),
     Full,
+    NoSuchShard,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,41 +205,13 @@ struct Session {
 /// slot changes hands.
 #[derive(Clone, Copy, Default)]
 struct Schedule {
-    /// The deadline of this slot's live timer entry. An entry carrying any
-    /// other time is stale and is skipped when it surfaces.
-    armed: Option<Timestamp>,
     /// Queued in `ready`.
     ready: bool,
     /// Queued in `retiring`.
     retiring: bool,
-    /// Why the connection closed, kept from the event that annouced it so
+    /// Why the connection closed, kept from the event that announced it so
     /// retirement still knows even though events are drained as they arrived.
     closed_with: CloseReason,
-}
-
-/// One connection's deadline in the timer heap. Ordered earliest first, ties
-/// broken by slot so equal deadlines are serviced in a reproducible order.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Timer {
-    at: Timestamp,
-    handle: Handle<ServerConnection>,
-}
-
-impl Ord for Timer {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Reversed, because `BinaryHeap` pops its greatest entry first.
-        other
-            .at
-            .cmp(&self.at)
-            .then_with(|| other.handle.index().cmp(&self.handle.index()))
-            .then_with(|| other.handle.generation().cmp(&self.handle.generation()))
-    }
-}
-
-impl PartialOrd for Timer {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 /// Where a packet should go. Two addresses while a connection is validating a
@@ -253,11 +248,6 @@ pub struct Endpoint {
     /// Spent tickets in order of expiry, so they are forgotten without a scan.
     redeemed_expiry: BinaryHeap<Reverse<(Timestamp, TicketId)>>,
 
-    /// Connection ids are monotonic rather than slot-derived, because a
-    /// slot-derived id would repeat once its per-slot counter wrapped, and an id
-    /// must not repeat while a session's keys are live.
-    routes: HashMap<ConnectionId, Handle<ServerConnection>>,
-
     sessions: HashMap<SessionId, Session>,
 
     acceptor: Acceptor,
@@ -266,14 +256,14 @@ pub struct Endpoint {
     requests: Bucket<GlobalRequests>,
     responses: Bucket<GlobalResponses>,
 
-    next_conn_id: u32,
-    next_session_id: u64,
+    next_session_sequence: u64,
 
     /// Indexed by a handle's slot.
     schedules: Box<[Schedule]>,
-    /// Each connection's next deadline, so a timer pass visits only the
-    /// connections that are due rather than every connection.
-    timers: BinaryHeap<Timer>,
+    /// Each connection's next deadline, keyed by slot, so a timer pass visits
+    /// only the connections that are due rather than every connection. At
+    /// most one entry per slot, moved in place when the deadline changes.
+    timers: TimerHeap,
     /// Connections that may have something to send, e.g., touched by a datagram,
     /// timer, or the application since they last transmitted. First in, first
     /// out, so a sink that fills resumes where it stopped.
@@ -285,11 +275,20 @@ pub struct Endpoint {
     /// suspended again, no longer matches the session table and is skipped.
     suspended: VecDeque<(Timestamp, SessionId)>,
 
-    events: RingQueue<Event, 64>,
+    /// Events not yet polled, oldest first. Never overwritten: an event
+    /// lost is a player the application never learns arrived or left.
+    ///
+    /// Reserved for the most one pass can produce. `handle_timeout` reports
+    /// at most `REAP_BATCH` departures and `REAP_BATCH` lapsed sessions, and
+    /// at most one migration per connection it services; a datagram produces
+    /// at most one event. A driver that polls after each timeout pass and each
+    /// receive batch therefore never grows it.
+    events: VecDeque<Event>,
 }
 
 impl Endpoint {
-    pub fn new(config: EndpointConfig, backend_key: Key, channels: &ChannelSet) -> Self {
+    pub fn new(mut config: EndpointConfig, backend_key: Key, channels: &ChannelSet) -> Self {
+        config.capacity = config.capacity.min(MAX_CONNECTIONS);
         // Headroom above capacity: a hash map grows before it is literally full,
         // and growing would allocate on the handshake path.
         let reserve = (config.capacity as usize) + ((config.capacity as usize) / 4) + 16;
@@ -300,28 +299,30 @@ impl Endpoint {
             connections: Slab::with_capacity(config.capacity),
             redeemed: HashMap::with_capacity(reserve),
             redeemed_expiry: BinaryHeap::with_capacity(reserve),
-            routes: HashMap::with_capacity(reserve),
             sessions: HashMap::with_capacity(reserve),
-            acceptor: Acceptor::new(backend_key),
+            acceptor: Acceptor::for_shard(backend_key, &config.shard),
             limiter: RateLimiter::new(config.limiter_slots),
             requests: Bucket::full(),
             responses: Bucket::full(),
-            // Starts above zero so a restarted server does not immediately
-            // reissue ids that clients from the previous run still hold.
-            next_conn_id: 1,
-            next_session_id: 1,
+            next_session_sequence: 1,
             schedules: vec![Schedule::default(); config.capacity as usize].into(),
-            timers: BinaryHeap::with_capacity(reserve),
+            timers: TimerHeap::with_slots(config.capacity),
             ready: VecDeque::with_capacity(reserve),
             retiring: VecDeque::with_capacity(reserve),
             suspended: VecDeque::with_capacity(reserve),
-            events: RingQueue::new(),
+            events: VecDeque::with_capacity((config.capacity as usize) + (2 * REAP_BATCH)),
         }
+    }
+
+    /// Which member of its group this endpoint is.
+    #[inline]
+    pub fn shard(&self) -> ShardId {
+        self.config.shard.id()
     }
 
     #[inline]
     pub fn poll_event(&mut self) -> Option<Event> {
-        self.events.pop()
+        self.events.pop_front()
     }
 
     #[inline]
@@ -389,6 +390,12 @@ impl Endpoint {
         out: &mut Packet,
         on_message: OnServerMessage,
     ) -> Action {
+        if let Some(owner) = owner_shard(&buf[..len])
+            && (owner != self.shard())
+        {
+            return self.misrouted(ctx, owner);
+        }
+
         let Some(kind) = peek_kind(buf, len) else {
             ctx.counters.inc(Counter::PacketsMalformed);
             return Action::Dropped(DropReason::Malformed);
@@ -403,6 +410,19 @@ impl Endpoint {
                 ctx.counters.inc(Counter::PacketsMalformed);
                 Action::Dropped(DropReason::Malformed)
             }
+        }
+    }
+
+    /// A datagram owned by another shard. Named for the caller to pass on when
+    /// the shard exists, and dropped when it does not, since then no endpoint
+    /// anywhere holds what it refers to.
+    fn misrouted(&mut self, ctx: &mut Ctx, owner: ShardId) -> Action {
+        if self.config.shard.count().contains(owner) {
+            ctx.counters.inc(Counter::PacketsMisrouted);
+            Action::Forward(owner)
+        } else {
+            ctx.counters.inc(Counter::PacketsUnknownConnection);
+            Action::Dropped(DropReason::NoSuchShard)
         }
     }
 
@@ -421,12 +441,15 @@ impl Endpoint {
             ctx.counters.inc(Counter::PacketsMalformed);
             return Action::Dropped(DropReason::Malformed);
         };
-        let Some(&handle) = self.routes.get(&header.conn_id) else {
+        let Some(handle) = self
+            .connections
+            .handle_at(header.conn_id.slot())
+            .filter(|&handle| self.conn_id_of(handle) == header.conn_id)
+        else {
             ctx.counters.inc(Counter::PacketsUnknownConnection);
             return Action::Dropped(DropReason::UnknownConnection);
         };
         let Some(conn) = self.connections.get_mut(handle) else {
-            self.routes.remove(&header.conn_id); // The route outlived its connection.
             ctx.counters.inc(Counter::PacketsUnknownConnection);
             return Action::Dropped(DropReason::UnknownConnection);
         };
@@ -459,30 +482,45 @@ impl Endpoint {
             Err(err) => return Action::Dropped(DropReason::Handshake(err)),
         };
 
-        if let Err(error) = self.check_ticket(ctx.now, &ticket) {
-            return Action::Dropped(DropReason::Handshake(error));
-        }
-
         let (Some(nonce), Some(ticket_id)) = (request_nonce(&buf[..len]), TicketId::of_request(&buf[..len])) else {
             return Action::Dropped(DropReason::Malformed);
         };
 
-        // Refused here rather than only at the response, so a replayed ticket
-        // costs the server no cookie.
-        if let Some(Redeemed { connection: None }) = self.redeemed.get(&ticket_id) {
-            return Action::Dropped(DropReason::Handshake(HandshakeError::Spent));
-        }
-
-        let mut cookie = [0u8; MAX_BLOB];
-        let cookie_len = match self
-            .acceptor
-            .encrypt_cookie(ctx.now, from, nonce, ticket_id, &ticket, &mut cookie)
-        {
-            Ok(cookie_len) => cookie_len,
-            Err(error) => return Action::Dropped(DropReason::Handshake(error)),
+        let Some(home) = self.acceptor.home(&ticket, ticket_id) else {
+            return Action::Dropped(DropReason::Handshake(HandshakeError::NoSession));
         };
 
-        match encode_handshake(PacketKind::Challenge, &cookie[..cookie_len], out) {
+        // Any shard answers a request, but only the ticket's home holds the
+        // session it names and the record of whether it is spent. Elsewhere
+        // only expiry can be judged; the cookie is addressed to the home,
+        // which checks the rest when the response reaches it.
+        if home == self.shard() {
+            if let Err(err) = self.check_ticket(ctx.now, &ticket) {
+                return Action::Dropped(DropReason::Handshake(err));
+            }
+            // Refused here rather than only at the response, so a replayed
+            // ticket costs the server no cookie.
+            if let Some(Redeemed { connection: None }) = self.redeemed.get(&ticket_id) {
+                return Action::Dropped(DropReason::Handshake(HandshakeError::Spent));
+            }
+        } else if let Err(error) = ticket.check_expiry(ctx.now) {
+            return Action::Dropped(DropReason::Handshake(error));
+        }
+
+        // Drawn per challenge, not per connection: the cookie seals it, so
+        // the server holds nothing for a handshake until one completes.
+        let server_nonce = ServerNonce::random();
+        let mut cookie = [0u8; MAX_BLOB];
+        let cookie_len =
+            match self
+                .acceptor
+                .encrypt_cookie(ctx.now, from, nonce, server_nonce, ticket_id, &ticket, &mut cookie)
+            {
+                Ok(cookie_len) => cookie_len,
+                Err(error) => return Action::Dropped(DropReason::Handshake(error)),
+            };
+
+        match encode_challenge(&cookie[..cookie_len], server_nonce, out) {
             Ok(len) => Action::Respond { addr: from, len },
             Err(_) => Action::Dropped(DropReason::Malformed),
         }
@@ -531,11 +569,19 @@ impl Endpoint {
             return Action::Dropped(DropReason::Handshake(error));
         }
 
+        // Refused before anything changes. A takeover closes the connection
+        // holding the session, which must not happen for a player the server
+        // then has no room for.
+        if self.connections.len() >= (self.connections.capacity() as usize) {
+            ctx.counters.inc(Counter::ConnectionsRejectedFull);
+            return Action::Dropped(DropReason::Full);
+        }
+
         let (session, resumed) = match cookie.ticket.session {
             Some(session) => (session, true),
             None => {
-                let session = SessionId(self.next_session_id);
-                self.next_session_id += 1;
+                let session = SessionId::new(self.next_session_sequence, self.shard());
+                self.next_session_sequence += 1;
                 (session, false)
             }
         };
@@ -549,29 +595,34 @@ impl Endpoint {
             conn.close(CloseReason::Replaced);
         }
 
-        let conn_id = ConnectionId(self.next_conn_id);
-        let keys = cookie.ticket.keys.for_connection(conn_id, cookie.nonce);
-        let conn = Connection::accept(
-            ctx.now,
-            conn_id,
-            session,
-            cookie.ticket_id,
-            from,
-            &keys,
-            self.channels,
-            self.config.budget,
-        );
-
-        let Ok(handle) = self.connections.insert(conn) else {
+        // The id is derived from the slot the connection is about to take,
+        // and the keys from the id and both handshake nonces.
+        let shard = self.shard();
+        let (channels, budget) = (self.channels, self.config.budget);
+        let inserted = self.connections.insert_with(|handle| {
+            let conn_id = conn_id_for(handle, shard);
+            let keys = cookie
+                .ticket
+                .keys
+                .for_connection(conn_id, cookie.nonce, cookie.server_nonce);
+            Connection::accept(
+                ctx.now,
+                conn_id,
+                session,
+                cookie.ticket_id,
+                from,
+                &keys,
+                channels,
+                budget,
+            )
+        });
+        let Some(handle) = inserted else {
             ctx.counters.inc(Counter::ConnectionsRejectedFull);
             return Action::Dropped(DropReason::Full);
         };
 
-        // Consumed only on success, so a failed insert does not burn an id.
-        self.next_conn_id = self.next_conn_id.wrapping_add(1);
         self.schedules[ix(handle)] = Schedule::default();
         self.touch(handle);
-        self.routes.insert(conn_id, handle);
         self.sessions.insert(
             session,
             Session {
@@ -583,17 +634,21 @@ impl Endpoint {
             .insert(cookie.ticket_id, Redeemed { connection: Some(handle) });
         self.redeemed_expiry
             .push(Reverse((cookie.ticket.expires_at, cookie.ticket_id)));
-
-        self.events.push(Event::Connected { handle, session, resumed });
+        self.events.push_back(Event::Connected { handle, session, resumed });
         Action::Connected(handle)
     }
 
+    /// The id of the connection `handle` refers to.
+    #[inline]
+    fn conn_id_of(&self, handle: Handle<ServerConnection>) -> ConnectionId {
+        conn_id_for(handle, self.shard())
+    }
+
     /// The single place ticket policy lives: expiry, and whether a resume is
-    /// permitted for the session named.
+    /// permitted for the session named. Only the ticket's home shard can
+    /// apply it, since only it holds the session.
     fn check_ticket(&self, now: Timestamp, ticket: &Ticket) -> Result<(), HandshakeError> {
-        if now > ticket.expires_at {
-            return Err(HandshakeError::Expired);
-        }
+        ticket.check_expiry(now)?;
 
         let Some(session) = ticket.session else { return Ok(()) };
         let Some(record) = self.sessions.get(&session) else { return Err(HandshakeError::NoSession) };
@@ -635,18 +690,17 @@ impl Endpoint {
                 sink.commit(Destinations { primary: conn.addr(), probe: conn.probe_addr() }, len);
             }
 
-            // Arms the connection's timer at its current deadline, or queue it for
-            // removal once it has closed.
-            // Only a deadline earlier than the armed one is pushed. A later one waits
-            // for the armed entry to surface, whose service rearms it.
-            if let Some(at) = conn.next_timeout() {
-                if schedule.armed.is_none_or(|armed| at < armed) {
-                    schedule.armed = Some(at);
-                    self.timers.push(Timer { at, handle });
+            // Moves the connection's timer to its current deadline, or queues
+            // it for removal once it has closed.
+            match conn.next_timeout() {
+                Some(at) => self.timers.set(handle.index(), at),
+                None => {
+                    self.timers.cancel(handle.index());
+                    if !schedule.retiring {
+                        schedule.retiring = true;
+                        self.retiring.push_back(handle);
+                    }
                 }
-            } else if !schedule.retiring {
-                schedule.retiring = true;
-                self.retiring.push_back(handle);
             }
         }
     }
@@ -659,24 +713,14 @@ impl Endpoint {
     /// rearmed after that transmit, not here, because deadlines such as an owed
     /// acknowledgement stay due until the packet goes out.
     pub fn handle_timeout(&mut self, ctx: &mut Ctx) {
-        while let Some(&timer) = self.timers.peek()
-            && timer.at <= ctx.now
-        {
-            self.timers.pop();
-            if !self.connections.contains(timer.handle) {
-                continue;
-            }
-            let schedule = &mut self.schedules[ix(timer.handle)];
-            if schedule.armed != Some(timer.at) {
-                continue;
-            }
-            schedule.armed = None;
-
-            if let Some(conn) = self.connections.get_mut(timer.handle) {
+        while let Some(slot) = self.timers.pop_due(ctx.now) {
+            // Every entry belongs to a live connection and retirement cancels it.
+            let Some(handle) = self.connections.handle_at(slot) else { continue };
+            if let Some(conn) = self.connections.get_mut(handle) {
                 conn.handle_timeout(ctx);
             }
-            self.touch(timer.handle);
-            self.pump_events(timer.handle);
+            self.touch(handle);
+            self.pump_events(handle);
         }
         self.reap(ctx.now);
         self.expire_sessions(ctx.now);
@@ -699,13 +743,12 @@ impl Endpoint {
     /// or `None` when there is nothing to wait for.
     ///
     /// A connection queued to transmit or awaiting removal makes the answer
-    /// `Timestamp::ZERO`, i.e., already due, whatever the time. Stale timer
-    /// entries can make it earlier than necessary, never later.
+    /// `Timestamp::ZERO`, i.e., already due, whatever the time.
     pub fn next_timeout(&self) -> Option<Timestamp> {
         if !self.ready.is_empty() || !self.retiring.is_empty() {
             return Some(Timestamp::ZERO);
         }
-        let timer = self.timers.peek().map(|timer| timer.at);
+        let timer = self.timers.peek().map(|(at, _)| at);
         let session = self
             .suspended
             .front()
@@ -734,7 +777,7 @@ impl Endpoint {
         }
 
         if let Some(addr) = migrated {
-            self.events.push(Event::Migrated { handle, session, addr });
+            self.events.push_back(Event::Migrated { handle, session, addr });
         }
 
         if let Some(reason) = closed {
@@ -766,7 +809,7 @@ impl Endpoint {
         self.pump_events(handle);
 
         let Some(conn) = self.connections.get(handle) else { return };
-        let (conn_id, session, ticket_id) = (conn.id(), conn.session(), conn.ticket_id());
+        let (session, ticket_id) = (conn.session(), conn.ticket_id());
         let reason = core::mem::take(&mut self.schedules[ix(handle)]).closed_with;
 
         // The ticket stays spent until it expires. Only the retry path closes.
@@ -774,7 +817,7 @@ impl Endpoint {
             redeemed.connection = None;
         }
 
-        self.routes.remove(&conn_id);
+        self.timers.cancel(handle.index());
         self.connections.remove(handle);
 
         let mut suspended = false;
@@ -795,7 +838,8 @@ impl Endpoint {
             }
         }
 
-        self.events.push(Event::Disconnected { session, reason, suspended });
+        self.events
+            .push_back(Event::Disconnected { session, reason, suspended });
     }
 
     /// Removes sessions whose grace period has lapsed, oldest first, at most a
@@ -814,7 +858,7 @@ impl Endpoint {
                 && suspended == since
             {
                 self.sessions.remove(&session);
-                self.events.push(Event::SessionExpired(session));
+                self.events.push_back(Event::SessionExpired(session));
                 expired += 1;
             }
         }
@@ -850,6 +894,14 @@ impl Endpoint {
 
         Ok(())
     }
+}
+
+/// The id of the connection `handle` refers to on `shard`. A slab generation
+/// is odd while occupied and advances twice per occupancy, so half of it
+/// counts the slot's occupancies.
+#[inline]
+fn conn_id_for(handle: Handle<ServerConnection>, shard: ShardId) -> ConnectionId {
+    ConnectionId::new(handle.index(), handle.generation() >> 1, shard)
 }
 
 fn charge<P: RefillPolicy>(

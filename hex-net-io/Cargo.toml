@@ -9,3 +9,14 @@ doctest = false
 
 [dependencies]
 hex-net-core = { workspace = true }
+
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.189"
+
+[dev-dependencies]
+hex-net-sim = { workspace = true }
+
+[[bench]]
+name = "pps"
+harness = false

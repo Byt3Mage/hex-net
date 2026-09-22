@@ -17,9 +17,11 @@ pub mod fixed;
 pub mod handshake;
 pub mod packet;
 pub mod seq;
+pub mod shard;
 pub mod slab;
 pub mod stats;
 pub mod time;
+pub mod timer;
 pub mod wire;
 
 #[cfg(test)]

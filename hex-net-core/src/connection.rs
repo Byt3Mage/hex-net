@@ -258,6 +258,11 @@ impl<R: Role> Connection<R> {
     }
 
     #[inline]
+    pub fn is_open(&self) -> bool {
+        self.lifecycle == Lifecycle::Open
+    }
+
+    #[inline]
     pub fn is_closed(&self) -> bool {
         self.lifecycle == Lifecycle::Closed
     }
