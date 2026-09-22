@@ -1,12 +1,10 @@
 //! The delivery ledger: outcomes, loss rules, probes, and RTT sampling.
 
-use std::time::Duration;
-
 use crate::{
     ack::{Delivery, Outgoing, Resolved, decode_ack_delay, encode_ack_delay},
     config::MaxAckDelay,
     seq::Sequence,
-    time::Timestamp,
+    time::{Span, Timestamp},
 };
 
 fn seq(n: u64) -> Sequence {
@@ -44,7 +42,7 @@ impl Ledger {
 
     fn ack(&mut self, now: Timestamp, n: u64, bits: u32) {
         self.delivery
-            .on_ack(now, seq(n), Some(Duration::ZERO), bits, |r| self.outcomes.push(r));
+            .on_ack(now, seq(n), Some(Span::ZERO), bits, |r| self.outcomes.push(r));
     }
 
     fn tick(&mut self, now: Timestamp) -> u8 {
@@ -65,8 +63,8 @@ fn an_acknowledgement_returns_the_record_and_samples_rtt() {
     ledger.ack(at(40), 1, 0);
 
     assert_eq!(ledger.take(), vec![Resolved::Acked(1)]);
-    assert_eq!(ledger.delivery.rtt().smoothed(), Duration::from_millis(40));
-    assert_eq!(ledger.delivery.rtt().min(), Some(Duration::from_millis(40)));
+    assert_eq!(ledger.delivery.rtt().smoothed(), Span::from_millis(40));
+    assert_eq!(ledger.delivery.rtt().min(), Some(Span::from_millis(40)));
 }
 
 #[test]
@@ -111,19 +109,23 @@ fn an_unacknowledged_tail_is_probed_not_declared_lost() {
     ledger.send(at(0), 1);
 
     // Unmeasured: 100 ms assumed, 50 ms deviation, plus the peer's holding time.
-    let first = at(0).saturating_add(Duration::from_millis(100 + 200) + MaxAckDelay::DEFAULT.get());
+    let first = at(0).saturating_add(Span::from_millis(100 + 200).saturating_add(MaxAckDelay::DEFAULT.get()));
     assert_eq!(ledger.delivery.next_timeout(), Some(first));
     assert_eq!(ledger.tick(at(324)), 0);
     assert_eq!(ledger.tick(first), 2, "a probe timeout owes two packets");
     assert!(ledger.take().is_empty(), "a probe is not a loss");
 
     // Backoff: measured from the last eliciting send, doubled.
-    let second = at(0).saturating_add((Duration::from_millis(100 + 200) + MaxAckDelay::DEFAULT.get()) * 2);
+    let second = at(0).saturating_add(
+        Span::from_millis(100 + 200)
+            .saturating_add(MaxAckDelay::DEFAULT.get())
+            .saturating_mul(2),
+    );
     assert_eq!(ledger.delivery.next_timeout(), Some(second));
 
     // The probe's acknowledgement puts packet 1 before the largest acked.
     ledger.send(first, 2);
-    ledger.ack(first.saturating_add(Duration::from_millis(40)), 2, 0);
+    ledger.ack(first.saturating_add(Span::from_millis(40)), 2, 0);
     assert_eq!(ledger.take(), vec![Resolved::Acked(2), Resolved::Lost(1)]);
 }
 
@@ -180,10 +182,10 @@ fn a_saturated_delay_yields_no_sample() {
 
     assert_eq!(ledger.take(), vec![Resolved::Acked(1)]);
     assert_eq!(ledger.delivery.rtt().min(), None, "unknown holding time, so no sample");
-    assert_eq!(decode_ack_delay(encode_ack_delay(Duration::from_millis(80))), None);
+    assert_eq!(decode_ack_delay(encode_ack_delay(Span::from_millis(80))), None);
     assert_eq!(
-        decode_ack_delay(encode_ack_delay(Duration::from_millis(10))),
-        Some(Duration::from_millis(10))
+        decode_ack_delay(encode_ack_delay(Span::from_millis(10))),
+        Some(Span::from_millis(10))
     );
 }
 
@@ -194,18 +196,18 @@ fn the_minimum_rtt_ages_out() {
     let mut n = 1;
     let mut exchange = |ledger: &mut Ledger, now: &mut Timestamp, rtt: u64| {
         ledger.send(*now, n);
-        *now = now.saturating_add(Duration::from_millis(rtt));
+        *now = now.saturating_add(Span::from_millis(rtt));
         ledger.ack(*now, n, 0);
         n += 1;
     };
 
     exchange(&mut ledger, &mut now, 20);
-    assert_eq!(ledger.delivery.rtt().min(), Some(Duration::from_millis(20)));
+    assert_eq!(ledger.delivery.rtt().min(), Some(Span::from_millis(20)));
 
     // The route lengthens. Within the window the old minimum holds; after it,
     // the new path defines the baseline.
     for _ in 0..200 {
         exchange(&mut ledger, &mut now, 60);
     }
-    assert_eq!(ledger.delivery.rtt().min(), Some(Duration::from_millis(60)));
+    assert_eq!(ledger.delivery.rtt().min(), Some(Span::from_millis(60)));
 }

@@ -5,9 +5,7 @@
 //! arrived is gone. The point is to watch the two sides talk and assert on
 //! every packet that crosses.
 
-use std::collections::VecDeque;
-use std::net::SocketAddr;
-use std::time::Duration;
+use std::{collections::VecDeque, net::SocketAddr};
 
 use hex_net_core::{
     channel::ChannelSet,
@@ -21,7 +19,7 @@ use hex_net_core::{
     handshake::{EncryptedTicket, SessionId, Ticket, UserData, encrypt_ticket},
     packet::Packet,
     stats::Counters,
-    time::Timestamp,
+    time::{Span, Timestamp},
     wire::{Header, MAX_DATAGRAM, PacketKind},
 };
 
@@ -129,7 +127,7 @@ pub const PAIR_TRANSPORT: TransportConfig = TransportConfig {
 pub struct Pair {
     now: Timestamp,
 
-    latency: Duration,
+    latency: Span,
 
     pub server: Endpoint,
     pub server_addr: SocketAddr,
@@ -158,18 +156,18 @@ pub struct Pair {
 
 impl Pair {
     pub fn new(channels: ChannelSet, client_id: u64) -> Self {
-        Self::with_latency(channels, client_id, Duration::ZERO)
+        Self::with_latency(channels, client_id, Span::ZERO)
     }
 
     /// Builds a pair whose client already holds a ticket for the server.
     ///
     /// `client_id` is the are the backend's to choose. A ticket is spent by the
     /// handshake it completes, so each connection needs a fresh one.
-    pub fn with_latency(channels: ChannelSet, client_id: u64, latency: Duration) -> Self {
+    pub fn with_latency(channels: ChannelSet, client_id: u64, latency: Span) -> Self {
         Self::with_transport(channels, client_id, latency, PAIR_TRANSPORT)
     }
 
-    pub fn with_transport(channels: ChannelSet, client_id: u64, latency: Duration, transport: TransportConfig) -> Self {
+    pub fn with_transport(channels: ChannelSet, client_id: u64, latency: Span, transport: TransportConfig) -> Self {
         let now = Timestamp::ZERO;
         let backend_key: Key = [0x5A; 32];
         let server_addr: SocketAddr = str::parse("10.0.0.1:9000").expect("literal address");
@@ -213,7 +211,7 @@ impl Pair {
     }
 
     /// Moves the clock. Delivers nothing on its own: a pass does that.
-    pub fn advance(&mut self, by: Duration) {
+    pub fn advance(&mut self, by: Span) {
         self.now = self.now.saturating_add(by);
     }
 
@@ -221,7 +219,7 @@ impl Pair {
     /// already on the wire keep their arrival times, so lowering it mid-flight
     /// would let later datagrams overtake earlier ones; only raise it while
     /// anything is on the wire.
-    pub fn set_latency(&mut self, latency: Duration) {
+    pub fn set_latency(&mut self, latency: Span) {
         self.latency = latency;
     }
 
@@ -252,7 +250,7 @@ impl Pair {
     }
 
     /// The client connection's smoothed round-trip estimate.
-    pub fn client_rtt(&self) -> Duration {
+    pub fn client_rtt(&self) -> Span {
         self.client.connection().expect("client is connected").rtt().smoothed()
     }
 
@@ -297,7 +295,7 @@ impl Pair {
     /// Runs for `duration` of simulated time, stopping at every arrival and
     /// deadline either side reports, as an event-driven driver would. Returns
     /// false if some deadline stayed due however many passes ran.
-    pub fn run_for(&mut self, duration: Duration) -> bool {
+    pub fn run_for(&mut self, duration: Span) -> bool {
         let end = self.now.saturating_add(duration);
         for _ in 0..RUN_LIMIT {
             self.pass();
@@ -317,7 +315,7 @@ impl Pair {
 
     /// Runs passes until `condition` holds, advancing the clock by `step`
     /// between them. Returns false if it never held.
-    pub fn run_until(&mut self, step: Duration, mut condition: impl FnMut(&Self) -> bool) -> bool {
+    pub fn run_until(&mut self, step: Span, mut condition: impl FnMut(&Self) -> bool) -> bool {
         for _ in 0..SETTLE_LIMIT {
             if condition(self) {
                 return true;
@@ -566,7 +564,7 @@ pub fn issue_ticket(
     keys: &Keys,
 ) -> EncryptedTicket {
     let ticket = Ticket {
-        expires_at: now.saturating_add(Duration::from_secs(60)),
+        expires_at: now.saturating_add(Span::from_secs(60)),
         client_id,
         session,
         keys: *keys,

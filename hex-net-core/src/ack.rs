@@ -5,12 +5,10 @@
 //! need back when its fate is known, and hands it back exactly once. There is
 //! no second table keyed by sequence to fall out of step with this one.
 
-use std::time::Duration;
-
 use crate::{
-    config::MaxAckDelay,
+    config::{ACK_DELAY_UNIT, MaxAckDelay},
     seq::{Sequence, SequenceBuffer},
-    time::Timestamp,
+    time::{Span, Timestamp},
 };
 
 /// A packet this far behind the largest acknowledged one is declared lost.
@@ -22,16 +20,48 @@ const REORDER_THRESHOLD: u64 = 3;
 const TIME_THRESHOLD_NUMERATOR: u32 = 9;
 const TIME_THRESHOLD_DENOMINATOR: u32 = 8;
 
+/// Weight of the history in the smoothed round trip and its deviation: one
+/// sample moves the average by an eighth and the deviation by a quarter, so a
+/// transient spike does not blow up every timer built on them.
+const SMOOTHING_WEIGHT: u64 = 7;
+const SMOOTHING_DIVISOR: u64 = 8;
+const DEVIATION_WEIGHT: u64 = 3;
+const DEVIATION_DIVISOR: u64 = 4;
+
 /// Floor for every timer, so a fast link does not produce one shorter than
 /// the tick that drives it.
-const TIMER_GRANULARITY: Duration = Duration::from_millis(2);
-
+const TIMER_GRANULARITY: Span = Span::from_millis(2);
 /// Assumed RTT before the first measurement.
-const INITIAL_RTT: Duration = Duration::from_millis(100);
+const INITIAL_RTT: Span = Span::from_millis(100);
 
-/// The probe timeout doubles on each consecutive expiry, up to this many
-/// doublings. Past that, the idle timeout decides the connection's fate.
-const MAX_PROBE_BACKOFF: u32 = 6;
+/// Consecutive probe timeouts without an acknowledgement, which the probe
+/// timeout doubles for.
+///
+/// Bounded at construction, so the doubling it drives is always a shift the
+/// machine can make and the timer it produces stays finite. Past the bound the
+/// idle timeout decides the connection's fate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ProbeBackoff(u32);
+
+impl ProbeBackoff {
+    const MAX: u32 = 6;
+
+    #[inline]
+    const fn factor(self) -> u32 {
+        1u32 << self.0
+    }
+
+    #[inline]
+    const fn doubled(self) -> ProbeBackoff {
+        let next = self.0 + 1;
+        ProbeBackoff(if next > Self::MAX { Self::MAX } else { next })
+    }
+}
+
+const _: () = assert!(
+    ProbeBackoff::MAX < u32::BITS,
+    "the probe backoff must be a shift in range"
+);
 
 /// Packets sent per probe timeout. Two, because the case that produces a
 /// probe is usually a burst of loss, and a single probe is likely to be lost
@@ -41,10 +71,9 @@ const PROBE_PACKETS: u8 = 2;
 
 /// The minimum RTT is taken over a window of this length, so a route change
 /// or one unusually fast sample stops defining "no queueing" once it ages out.
-const MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
-
-/// Wire resolution of the acknowledgement delay field.
-pub const ACK_DELAY_UNIT: Duration = Duration::from_micros(250);
+const MIN_RTT_WINDOW: Span = Span::from_secs(10);
+/// Half the window, which is how often the minimum rolls over.
+const MIN_RTT_HALF_WINDOW: Span = Span::from_nanos(MIN_RTT_WINDOW.as_nanos() / 2);
 
 /// What became of a packet. Each tracked packet produces exactly one
 /// `Acked` or `Lost`, carrying the record stored when it was sent. A packet
@@ -94,18 +123,18 @@ struct Sent<P> {
 /// window.
 #[derive(Clone, Copy, Debug)]
 struct WindowedMin {
-    current: Duration,
-    previous: Duration,
+    current: Span,
+    previous: Span,
     epoch: Timestamp,
 }
 
 impl WindowedMin {
-    fn new(now: Timestamp, sample: Duration) -> Self {
+    fn new(now: Timestamp, sample: Span) -> Self {
         Self { current: sample, previous: sample, epoch: now }
     }
 
-    fn update(&mut self, now: Timestamp, sample: Duration) {
-        if now.saturating_since(self.epoch) >= (MIN_RTT_WINDOW / 2) {
+    fn update(&mut self, now: Timestamp, sample: Span) {
+        if now.since(self.epoch) >= MIN_RTT_HALF_WINDOW {
             self.previous = self.current;
             self.current = sample;
             self.epoch = now;
@@ -114,19 +143,19 @@ impl WindowedMin {
         }
     }
 
-    fn get(&self) -> Duration {
+    fn get(&self) -> Span {
         self.current.min(self.previous)
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Estimate {
-    latest: Duration,
+    latest: Span,
     /// Smoothed average, used for timers.
-    smoothed: Duration,
+    smoothed: Span,
     /// Mean deviation: jitter. Two paths with the same average but different
     /// jitter need different timer margins, which the probe timeout applies.
-    variation: Duration,
+    variation: Span,
     /// Lowest seen recently, approximating the path with empty queues.
     min: WindowedMin,
 }
@@ -142,24 +171,24 @@ pub struct Rtt {
 
 impl Rtt {
     #[inline]
-    pub fn smoothed(&self) -> Duration {
+    pub fn smoothed(&self) -> Span {
         self.estimate.map_or(INITIAL_RTT, |e| e.smoothed)
     }
 
     #[inline]
-    pub fn latest(&self) -> Duration {
+    pub fn latest(&self) -> Span {
         self.estimate.map_or(INITIAL_RTT, |e| e.latest)
     }
 
     #[inline]
-    pub fn variation(&self) -> Duration {
-        self.estimate.map_or(INITIAL_RTT / 2, |e| e.variation)
+    pub fn variation(&self) -> Span {
+        self.estimate.map_or(INITIAL_RTT.scaled::<1, 2>(), |e| e.variation)
     }
 
     /// The windowed minimum, or `None` before any measurement: there is no
     /// baseline to compare queueing against until the path has been sampled.
     #[inline]
-    pub fn min(&self) -> Option<Duration> {
+    pub fn min(&self) -> Option<Span> {
         self.estimate.map(|e| e.min.get())
     }
 
@@ -169,14 +198,14 @@ impl Rtt {
         self.estimate = None;
     }
 
-    fn update(&mut self, now: Timestamp, sample: Duration, ack_delay: Duration) {
+    fn update(&mut self, now: Timestamp, sample: Span, ack_delay: Span) {
         let Some(estimate) = &mut self.estimate else {
             // The first sample stands alone: there is no baseline yet to judge
             // the reported delay against, so it is not subtracted.
             self.estimate = Some(Estimate {
                 latest: sample,
                 smoothed: sample,
-                variation: sample / 2,
+                variation: sample.scaled::<1, 2>(),
                 min: WindowedMin::new(now, sample),
             });
             return;
@@ -188,18 +217,16 @@ impl Rtt {
         // Remove the peer's holding time, but never below the best round trip
         // seen: a correction that deep means the reported delay is wrong.
         let min = estimate.min.get();
-        let adjusted = match sample.checked_sub(ack_delay) {
-            Some(adjusted) if adjusted >= min => adjusted,
-            _ => sample,
-        };
-
+        let corrected = sample.saturating_sub(ack_delay);
+        let adjusted = if corrected >= min { corrected } else { sample };
         let deviation = adjusted.abs_diff(estimate.smoothed);
 
-        // Deliberately slow: one outlier moves the average by an eighth and the
-        // deviation by a quarter, so a transient spike does not blow up every
-        // timer built on them.
-        estimate.variation = ((estimate.variation * 3) + deviation) / 4;
-        estimate.smoothed = ((estimate.smoothed * 7) + adjusted) / 8;
+        estimate.variation = Span::from_nanos(
+            ((estimate.variation.as_nanos() * DEVIATION_WEIGHT) + deviation.as_nanos()) / DEVIATION_DIVISOR,
+        );
+        estimate.smoothed = Span::from_nanos(
+            ((estimate.smoothed.as_nanos() * SMOOTHING_WEIGHT) + adjusted.as_nanos()) / SMOOTHING_DIVISOR,
+        );
     }
 }
 
@@ -228,11 +255,10 @@ pub struct Delivery<P, const N: usize = 64> {
     rtt: Rtt,
     /// Tracked packets whose fate is still unknown.
     in_flight: u32,
-    /// Consecutive probe timeouts without an acknowledgement in between.
-    probes: u32,
-    /// Longest the peer holds and acknowledgement. The probe timeout allows for,
+    probes: ProbeBackoff,
+    /// Longest the peer holds an acknowledgement. The probe timeout allows for
     /// it, since the peer is entitled to wait this long.
-    peer_ack_delay: Duration,
+    peer_ack_delay: Span,
 }
 
 impl<P, const N: usize> Delivery<P, N> {
@@ -248,7 +274,7 @@ impl<P, const N: usize> Delivery<P, N> {
             last_eliciting: now,
             rtt: Rtt::default(),
             in_flight: 0,
-            probes: 0,
+            probes: ProbeBackoff::default(),
             peer_ack_delay: peer_ack_delay.get(),
         }
     }
@@ -274,7 +300,7 @@ impl<P, const N: usize> Delivery<P, N> {
     /// be acknowledged over the new path.
     pub fn on_path_change(&mut self) {
         self.rtt.reset();
-        self.probes = 0;
+        self.probes = ProbeBackoff::default();
     }
 
     /// Records a packet on its way out.
@@ -320,7 +346,7 @@ impl<P, const N: usize> Delivery<P, N> {
         &mut self,
         now: Timestamp,
         ack: Sequence,
-        ack_delay: Option<Duration>,
+        ack_delay: Option<Span>,
         bits: u32,
         mut notify: impl FnMut(Resolved<P>),
     ) {
@@ -341,13 +367,13 @@ impl<P, const N: usize> Delivery<P, N> {
         if self.largest_acked.is_none_or(|largest| ack > largest) {
             self.largest_acked = Some(ack);
             if let (Some(sent_at), Some(ack_delay)) = (newest_sent_at, ack_delay) {
-                self.rtt.update(now, now.saturating_since(sent_at), ack_delay);
+                self.rtt.update(now, now.since(sent_at), ack_delay);
             }
         }
 
         // Progress, so the path is alive and the probe backoff starts over.
         if confirmed_any {
-            self.probes = 0;
+            self.probes = ProbeBackoff::default();
         }
 
         // Run now rather than waiting for a timer: this acknowledgement may
@@ -365,7 +391,7 @@ impl<P, const N: usize> Delivery<P, N> {
         if now < deadline {
             return None;
         }
-        self.probes = (self.probes + 1).min(MAX_PROBE_BACKOFF);
+        self.probes = self.probes.doubled();
         Some(Probe { packets: PROBE_PACKETS })
     }
 
@@ -415,7 +441,7 @@ impl<P, const N: usize> Delivery<P, N> {
                 && let State::InFlight(_) = record.state
             {
                 let by_count = threshold.is_some_and(|threshold| sequence <= threshold);
-                let by_time = now.saturating_since(record.sent_at) >= delay;
+                let by_time = now.since(record.sent_at) >= delay;
                 if !(by_count || by_time) {
                     // Both rules are monotone in sequence: later packets are
                     // closer to the largest acknowledged and were sent no
@@ -455,14 +481,21 @@ impl<P, const N: usize> Delivery<P, N> {
     /// acknowledgement that is merely late does not trigger it.
     fn probe_deadline(&self) -> Option<Timestamp> {
         let _ = self.oldest_in_flight()?;
-        let base = self.rtt.smoothed() + (self.rtt.variation() * 4).max(TIMER_GRANULARITY) + self.peer_ack_delay;
-        Some(self.last_eliciting.saturating_add(base * (1u32 << self.probes)))
+        let base = self
+            .rtt
+            .smoothed()
+            .saturating_add(self.rtt.variation().saturating_mul(4).max(TIMER_GRANULARITY))
+            .saturating_add(self.peer_ack_delay);
+        Some(
+            self.last_eliciting
+                .saturating_add(base.saturating_mul(self.probes.factor())),
+        )
     }
 
-    fn loss_delay(&self) -> Duration {
+    fn loss_delay(&self) -> Span {
         let base = self.rtt.smoothed().max(self.rtt.latest());
-        let scaled = (base * TIME_THRESHOLD_NUMERATOR) / TIME_THRESHOLD_DENOMINATOR;
-        scaled.max(TIMER_GRANULARITY)
+        base.scaled::<TIME_THRESHOLD_NUMERATOR, TIME_THRESHOLD_DENOMINATOR>()
+            .max(TIMER_GRANULARITY)
     }
 
     fn advance_oldest(&mut self) {
@@ -477,14 +510,14 @@ impl<P, const N: usize> Delivery<P, N> {
 /// reserved to mean "at least this long", so a saturated delay is never
 /// mistaken for a measured one.
 #[inline]
-pub fn encode_ack_delay(delay: Duration) -> u8 {
-    let units = delay.as_micros() / ACK_DELAY_UNIT.as_micros();
+pub fn encode_ack_delay(delay: Span) -> u8 {
+    let units = delay.as_nanos() / ACK_DELAY_UNIT.as_nanos();
     u8::try_from(units).unwrap_or(u8::MAX)
 }
 
 /// The delay a header reports, or `None` when it saturated and the true delay
 /// is unknown.
 #[inline]
-pub fn decode_ack_delay(encoded: u8) -> Option<Duration> {
-    (encoded != u8::MAX).then(|| ACK_DELAY_UNIT * u32::from(encoded))
+pub fn decode_ack_delay(encoded: u8) -> Option<Span> {
+    (encoded != u8::MAX).then(|| ACK_DELAY_UNIT.saturating_mul(u32::from(encoded)))
 }

@@ -4,29 +4,26 @@
 //! receives at the address it claims, and every handshake packet is padded so a
 //! reply is never larger than the request.
 
-use std::{
-    net::{IpAddr, SocketAddr},
-    time::Duration,
-};
+use std::net::{IpAddr, SocketAddr};
 
 use crate::{
     bits::{BitReader, BitWriter, ReadError, WriteError},
     crypto::{self, Key, Keys, MAX_BLOB, NONCE_LEN},
     fixed::FixedVec,
     shard::{SHARD_BITS, Shard, ShardCount, ShardId},
-    time::Timestamp,
+    time::{Span, Timestamp},
     wire::{ClientNonce, HANDSHAKE_LEN, PROTOCOL_ID, ServerNonce, handshake_blob},
 };
 
 /// How long a client has to return a cookie.
-pub const COOKIE_LIFETIME: Duration = Duration::from_secs(10);
+pub const COOKIE_LIFETIME: Span = Span::from_secs(10);
 
 /// How long a disconnected player's session stays resumable.
-pub const RESUME_GRACE: Duration = Duration::from_secs(45);
+pub const RESUME_GRACE: Span = Span::from_secs(45);
 
 /// Resume tickets outlive the grace period, so one issued just before a drop is
 /// still usable.
-pub const RESUME_TICKET_LIFETIME: Duration = Duration::from_secs(180);
+pub const RESUME_TICKET_LIFETIME: Span = Span::from_secs(180);
 
 pub const MAX_USER_DATA: usize = 256;
 

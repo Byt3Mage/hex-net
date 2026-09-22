@@ -27,7 +27,7 @@ use std::{
 
 use hex_net_core::{
     shard::{SHARD_BITS, Shard, ShardGroup},
-    time::{Clock, MonotonicClock, Timestamp},
+    time::{Clock, MonotonicClock, Span, Timestamp},
     wire::{HANDSHAKE_BODY_OFFSET, HANDSHAKE_LEN, MIN_PAYLOAD_HEADER, PacketKind, SHARD_OFFSET, flags::KIND_MASK},
 };
 
@@ -628,7 +628,7 @@ fn arrival(control: &[u8], now: Timestamp, wall: SystemTime) -> Timestamp {
         // sample; reading it as an underflow would put arrival in the far
         // future and stop the connection ever timing out.
         Some(stamp) => {
-            let age = wall.duration_since(stamp).unwrap_or(Duration::ZERO);
+            let age = Span::from_duration(wall.duration_since(stamp).unwrap_or(Duration::ZERO));
             now.checked_sub(age).unwrap_or(now)
         }
         None => now,

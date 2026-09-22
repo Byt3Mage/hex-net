@@ -8,7 +8,6 @@ use std::{
     collections::{BTreeSet, BinaryHeap, HashMap},
     net::{Ipv4Addr, SocketAddr},
     rc::Rc,
-    time::Duration,
 };
 
 use hex_net_core::{
@@ -18,7 +17,7 @@ use hex_net_core::{
     crypto::{Key, Keys},
     endpoint::{Endpoint, EndpointConfig},
     handshake::{EncryptedTicket, SessionId},
-    time::Timestamp,
+    time::{Span, Timestamp},
 };
 use hex_net_io::driver::{ClientApp, ClientDriver, ServerApp, ServerDriver};
 
@@ -316,7 +315,7 @@ impl<S: ServerApp, C: ClientApp> World<S, C> {
 
     /// Runs until `duration` of simulated time has passed, stepping each node
     /// at every datagram landing for it and every deadline it reported.
-    pub fn run_for(&mut self, duration: Duration) -> Result<(), Stall> {
+    pub fn run_for(&mut self, duration: Span) -> Result<(), Stall> {
         let end = self.now.saturating_add(duration);
         let mut steps_at_instant = 0;
 

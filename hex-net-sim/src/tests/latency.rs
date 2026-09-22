@@ -1,20 +1,19 @@
 //! The transport over a wire with delay, driven by the deadlines each side
 //! reports rather than by a fixed tick.
 
-use std::time::Duration;
-
 use hex_net_core::{
     channel::{ChannelKind, ChannelSet},
     config::{MaxAckDelay, TransportConfig},
     connector::State as ClientState,
     stats::Counter,
+    time::Span,
 };
 
 use crate::pair::{Datagram, Pair};
 
 const ORDERED: ChannelSet = ChannelSet::new([ChannelKind::ReliableOrdered]);
 
-const ONE_WAY: Duration = Duration::from_millis(40);
+const ONE_WAY: Span = Span::from_millis(40);
 
 /// Connects, then trades enough messages for both RTT estimates to settle on
 /// the path.
@@ -34,9 +33,9 @@ fn the_round_trip_is_measured_over_a_slow_link() {
     let pair = converged_pair();
     let rtt = pair.client_rtt();
     assert!(
-        (rtt >= (ONE_WAY * 2)) && (rtt <= ((ONE_WAY * 2) + Duration::from_millis(1))),
+        (rtt >= ONE_WAY.saturating_mul(2)) && (rtt <= ONE_WAY.saturating_mul(2).saturating_add(Span::from_millis(1))),
         "measured {rtt:?} over a {:?} round trip",
-        ONE_WAY * 2
+        ONE_WAY.saturating_mul(2)
     );
 }
 
@@ -59,11 +58,11 @@ fn a_path_that_slows_down_is_probed_not_declared_lost() {
     // acknowledgement arrives long after 9/8 of the estimate. Nothing was
     // lost, and nothing may be declared lost.
     let mut pair = converged_pair();
-    pair.set_latency(Duration::from_millis(100));
+    pair.set_latency(Span::from_millis(100));
 
     let delivered = pair.server_inbox.len();
     pair.client_send(0, b"slow");
-    assert!(pair.run_for(Duration::from_secs(2)), "every deadline was serviced");
+    assert!(pair.run_for(Span::from_secs(2)), "every deadline was serviced");
 
     assert_eq!(pair.server_inbox.len(), delivered + 1, "delivered exactly once");
     assert_eq!(pair.client_counters.get(Counter::PacketsLost), 0);
@@ -85,7 +84,7 @@ fn a_burst_over_budget_resumes_as_soon_as_the_budget_allows() {
     for _ in 0..3 {
         pair.client_send(0, &payload);
     }
-    assert!(pair.run_for(Duration::from_millis(300)), "every deadline was serviced");
+    assert!(pair.run_for(Span::from_millis(300)), "every deadline was serviced");
 
     assert_eq!(pair.server_inbox.len(), 3, "the whole burst arrived");
 }
@@ -94,7 +93,7 @@ fn a_burst_over_budget_resumes_as_soon_as_the_budget_allows() {
 fn an_idle_connection_driven_by_deadlines_stays_up() {
     let mut pair = converged_pair();
 
-    assert!(pair.run_for(Duration::from_secs(30)), "every deadline was serviced");
+    assert!(pair.run_for(Span::from_secs(30)), "every deadline was serviced");
 
     assert_eq!(pair.client_state(), ClientState::Connected);
     assert_eq!(pair.server.num_connections(), 1);
@@ -105,7 +104,7 @@ fn an_idle_connection_driven_by_deadlines_stays_up() {
 /// A connected pair on a wire with no delay, both sides holding
 /// acknowledgements for the default time.
 fn deferring_pair() -> Pair {
-    let mut pair = Pair::with_transport(ORDERED, 1, Duration::ZERO, TransportConfig::DEFAULT);
+    let mut pair = Pair::with_transport(ORDERED, 1, Span::ZERO, TransportConfig::DEFAULT);
     assert!(pair.settle(), "the handshake completed");
     assert_eq!(pair.client_state(), ClientState::Connected);
     pair
@@ -149,11 +148,11 @@ fn an_acknowledgement_with_nothing_to_carry_it_goes_alone_at_its_deadline() {
     pair.pass();
     let before = from_server(&pair).len();
 
-    pair.advance(delay - Duration::from_millis(1));
+    pair.advance(delay.saturating_sub(Span::from_millis(1)));
     pair.pass();
     assert_eq!(from_server(&pair).len(), before, "still within the delay");
 
-    pair.advance(Duration::from_millis(1));
+    pair.advance(Span::from_millis(1));
     pair.pass();
     let sent = from_server(&pair);
     assert_eq!(sent.len(), before + 1, "the acknowledgement went out alone");

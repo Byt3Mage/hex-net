@@ -37,15 +37,14 @@ use std::{
 };
 
 use hex_net_core::{
-    budget::BudgetConfig,
     channel::{ChannelKind, ChannelSet},
-    config::{MaxAckDelay, TransportConfig},
+    config::{BudgetConfig, MaxAckDelay, TransportConfig},
     connector::{Connector, State},
     crypto::Key,
     endpoint::{Endpoint, EndpointConfig, Event, ServerConnection},
     slab::Handle,
     stats::Counter,
-    time::{Clock, MonotonicClock, Timestamp},
+    time::{Clock, MonotonicClock, Span, Timestamp},
     wire::MAX_DATAGRAM,
 };
 use hex_net_io::{
@@ -95,7 +94,7 @@ const RATE: u32 = 64_000;
 
 /// Longer than the gap between one side's packets, so every acknowledgement
 /// rides on an input or a snapshot and none goes out alone.
-const MAX_ACK_DELAY: Duration = Duration::from_millis(50);
+const MAX_ACK_DELAY: Span = Span::from_millis(50);
 
 /// How long every client has to finish its handshake.
 const CONNECT_LIMIT: Duration = Duration::from_secs(60);
@@ -159,15 +158,14 @@ fn number<T: std::str::FromStr>(value: Option<String>, flag: &str) -> T {
         .unwrap_or_else(|| panic!("{flag} takes a number"))
 }
 
-fn tick_period() -> Duration {
-    Duration::from_nanos(1_000_000_000 / u64::from(SIM_HZ))
+fn tick_period() -> Span {
+    Span::from_nanos(Span::NANOS_PER_SECOND / u64::from(SIM_HZ))
 }
 
 fn transport() -> TransportConfig {
-    TransportConfig {
-        budget: BudgetConfig::new(RATE, MAX_DATAGRAM).expect("the benchmark budget is within bounds"),
-        max_ack_delay: MaxAckDelay::new(MAX_ACK_DELAY).expect("the benchmark delay is within the header's range"),
-    }
+    TransportConfig::DEFAULT
+        .with_budget(BudgetConfig::new(RATE, MAX_DATAGRAM).expect("the benchmark budget is within bounds"))
+        .with_max_ack_delay(MaxAckDelay::new(MAX_ACK_DELAY).expect("the benchmark delay is within the header's range"))
 }
 
 /// Counts every thread adds to as it goes, read by the thread measuring.
@@ -405,7 +403,7 @@ struct Player {
     connected: bool,
     input: [u8; INPUT_LEN],
     /// Fraction of the input period this client lags the others by.
-    phase: Duration,
+    phase: Span,
     next_input: Option<Timestamp>,
     tally: Arc<Tally>,
 }
@@ -445,8 +443,8 @@ impl ClientApp for Player {
     }
 }
 
-fn input_period() -> Duration {
-    tick_period() * TICKS_PER_INPUT
+fn input_period() -> Span {
+    tick_period().saturating_mul(TICKS_PER_INPUT)
 }
 
 /// A distinct loopback host per client on Linux, so the handshake limiter
@@ -503,7 +501,7 @@ fn load<S: Socket>(
         if let Some(&Reverse((at, _))) = due.peek() {
             let now = clock.now();
             if at > now {
-                thread::sleep(at.saturating_since(now));
+                thread::sleep(at.since(now).as_duration());
             }
         }
     }
@@ -560,7 +558,9 @@ where
         let app = Player {
             connected: false,
             input: [0x1A; INPUT_LEN],
-            phase: (input_period() * ((index as u32) % spread)) / spread,
+            phase: Span::from_nanos(
+                (input_period().as_nanos() * u64::from((index as u32) % spread)) / u64::from(spread),
+            ),
             next_input: None,
             tally: Arc::clone(&tally),
         };

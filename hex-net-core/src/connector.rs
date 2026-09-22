@@ -1,7 +1,6 @@
 //! The client's side: driving one handshake and one connection.
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use crate::{
     channel::{ChannelSet, OnMessage},
@@ -13,7 +12,7 @@ use crate::{
     handshake::EncryptedTicket,
     packet::Packet,
     stats::Counter,
-    time::Timestamp,
+    time::{Span, Timestamp},
     wire::{
         ClientNonce, HANDSHAKE_LEN, Header, PacketKind, ServerNonce, challenge_nonce, encode_handshake, encode_request,
         handshake_blob,
@@ -21,10 +20,9 @@ use crate::{
 };
 
 /// Handshake steps are resent on this interval until answered.
-const RETRY_INTERVAL: Duration = Duration::from_millis(250);
-
+const RETRY_INTERVAL: Span = Span::from_millis(250);
 /// Gives up after this long, about twenty attempts.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: Span = Span::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectError {
@@ -271,7 +269,7 @@ impl Connector {
         match self.state {
             State::Requesting | State::Responding => {
                 if let Some(last) = self.last_attempt
-                    && ctx.now.saturating_since(last) < RETRY_INTERVAL
+                    && ctx.now.since(last) < RETRY_INTERVAL
                 {
                     return None;
                 }
@@ -295,7 +293,7 @@ impl Connector {
     pub fn handle_timeout(&mut self, ctx: &mut Ctx) -> Action {
         match self.state {
             State::Requesting | State::Responding => {
-                if ctx.now.saturating_since(self.started) >= HANDSHAKE_TIMEOUT {
+                if ctx.now.since(self.started) >= HANDSHAKE_TIMEOUT {
                     self.state = State::Failed(ConnectError::TimedOut);
                     return Action::Ended;
                 }

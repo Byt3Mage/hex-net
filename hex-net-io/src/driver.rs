@@ -8,7 +8,6 @@
 use std::{
     io,
     net::{Ipv4Addr, SocketAddr},
-    time::Duration,
 };
 
 use hex_net_core::{
@@ -18,7 +17,7 @@ use hex_net_core::{
     packet::Packet,
     slab::Handle,
     stats::{Counter, Counters},
-    time::Timestamp,
+    time::{Span, Timestamp},
     wire::MAX_DATAGRAM,
 };
 
@@ -178,7 +177,7 @@ impl PacketSink for Outbox {
 /// Deadlines are not held back by it, and arrival times come from the kernel,
 /// so round-trip samples are unaffected. What it adds is up to this long before
 /// a datagram is read.
-pub const DEFAULT_STEP_INTERVAL: Duration = Duration::from_millis(1);
+pub const DEFAULT_STEP_INTERVAL: Span = Span::from_millis(1);
 
 /// Runs an endpoint over a socket.
 pub struct ServerDriver<S: Socket> {
@@ -188,7 +187,7 @@ pub struct ServerDriver<S: Socket> {
     inbox: Inbox,
     reply: Box<Packet>,
     outbox: Outbox,
-    step_interval: Duration,
+    step_interval: Span,
 }
 
 impl<S: Socket> ServerDriver<S> {
@@ -207,12 +206,12 @@ impl<S: Socket> ServerDriver<S> {
     /// How long after a step's start the next may begin, when only arrivals
     /// would wake it. Zero steps on every arrival.
     #[inline]
-    pub fn step_interval(&self) -> Duration {
+    pub fn step_interval(&self) -> Span {
         self.step_interval
     }
 
     #[inline]
-    pub fn set_step_interval(&mut self, interval: Duration) {
+    pub fn set_step_interval(&mut self, interval: Span) {
         self.step_interval = interval;
     }
 

@@ -1,13 +1,13 @@
 //! The timer heap: one deadline per slot, moved in place, served earliest
 //! first.
 
-use std::time::Duration;
-
-use crate::time::Timestamp;
-use crate::timer::TimerHeap;
+use crate::{
+    time::{Span, Timestamp},
+    timer::TimerHeap,
+};
 
 fn at(ms: u64) -> Timestamp {
-    Timestamp::ZERO.saturating_add(Duration::from_millis(ms))
+    Timestamp::ZERO.saturating_add(Span::from_millis(ms))
 }
 
 #[test]

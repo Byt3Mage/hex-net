@@ -28,7 +28,7 @@ use hex_net_core::{
     endpoint::{Endpoint, EndpointConfig, Event, ServerConnection},
     shard::Shard,
     slab::Handle,
-    time::{Clock, MonotonicClock, Timestamp},
+    time::{Clock, MonotonicClock, Span, Timestamp},
 };
 use hex_net_io::{
     Socket, Wait,
@@ -42,7 +42,7 @@ const BACKEND_KEY: Key = [0x3C; 32];
 const ORDERED: ChannelSet = ChannelSet::new([ChannelKind::ReliableOrdered]);
 
 /// One message per 128 Hz tick.
-const INTERVAL: Duration = Duration::from_micros(7812);
+const INTERVAL: Span = Span::from_micros(7812);
 
 const TOTAL: u32 = 128;
 
@@ -403,7 +403,7 @@ mod linux {
         assert_eq!(chatter.round_trips.len(), TOTAL as usize);
         for (seq, elapsed) in &chatter.round_trips {
             assert!(
-                (*elapsed > Duration::ZERO) && (*elapsed < Duration::from_secs(1)),
+                (*elapsed > Span::ZERO) && (*elapsed < Span::from_secs(1)),
                 "message {seq} took {elapsed:?}"
             );
         }

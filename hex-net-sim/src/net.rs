@@ -12,10 +12,9 @@ use std::{
     io,
     net::SocketAddr,
     rc::Rc,
-    time::Duration,
 };
 
-use hex_net_core::time::Timestamp;
+use hex_net_core::time::{Span, Timestamp};
 use hex_net_io::{Received, Socket, Transmit};
 
 /// splitmix64: small, fast, and good enough to drive network conditions.
@@ -44,12 +43,12 @@ impl Rng {
     }
 
     /// Uniform in [0, max].
-    pub fn duration_up_to(&mut self, max: Duration) -> Duration {
-        let nanos = u64::try_from(max.as_nanos()).unwrap_or(u64::MAX);
+    pub fn duration_up_to(&mut self, max: Span) -> Span {
+        let nanos = max.as_nanos();
         if nanos == 0 {
-            return Duration::ZERO;
+            return Span::ZERO;
         }
-        Duration::from_nanos(self.next_u64() % (nanos + 1))
+        Span::from_nanos(self.next_u64() % (nanos + 1))
     }
 }
 
@@ -70,10 +69,10 @@ pub struct Burst {
 /// Conditions in one direction of one path.
 #[derive(Clone, Copy, Debug)]
 pub struct Link {
-    pub latency: Duration,
+    pub latency: Span,
     /// Extra delay drawn uniformly from zero to this, per datagram. More jitter
     /// than the gap between datagrams reorders them.
-    pub jitter: Duration,
+    pub jitter: Span,
     /// Chance of losing a datagram outside a burst.
     pub loss: f64,
     pub burst: Option<Burst>,
@@ -83,10 +82,10 @@ pub struct Link {
 
 impl Link {
     /// Fixed delay, nothing lost, nothing reordered.
-    pub const fn clean(latency: Duration) -> Link {
+    pub const fn clean(latency: Span) -> Link {
         Link {
             latency,
-            jitter: Duration::ZERO,
+            jitter: Span::ZERO,
             loss: 0.0,
             burst: None,
             duplicate: 0.0,
@@ -313,7 +312,7 @@ impl Wire {
         }
 
         for _ in 0..copies {
-            let delay = link.latency + self.rng.duration_up_to(link.jitter);
+            let delay = link.latency.saturating_add(self.rng.duration_up_to(link.jitter));
             let at = self.now.saturating_add(delay);
             self.order += 1;
             self.mix(at.as_nanos());

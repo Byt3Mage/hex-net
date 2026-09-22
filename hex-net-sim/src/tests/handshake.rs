@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use hex_net_core::{
     channel::{ChannelKind, ChannelSet},
     connector::State as ClientState,
@@ -10,7 +8,7 @@ use hex_net_core::{
     },
     packet::Packet,
     shard::ShardId,
-    time::Timestamp,
+    time::{Span, Timestamp},
     wire::{ClientNonce, HANDSHAKE_LEN, MAX_DATAGRAM, PacketKind, ServerNonce, encode_handshake},
 };
 
@@ -29,7 +27,7 @@ fn a_ticket_round_trips_through_a_request() {
     assert!(user_data.extend_from_slice(b"opaque to the transport"));
 
     let original = Ticket {
-        expires_at: now.saturating_add(Duration::from_secs(60)),
+        expires_at: now.saturating_add(Span::from_secs(60)),
         client_id: 0x0123_4567_89AB_CDEF,
         session: None,
         keys,
@@ -87,7 +85,7 @@ fn a_foreign_key_does_not_open_a_ticket() {
     let now = Timestamp::ZERO;
 
     let ticket = Ticket {
-        expires_at: now.saturating_add(Duration::from_secs(60)),
+        expires_at: now.saturating_add(Span::from_secs(60)),
         client_id: 1,
         session: None,
         keys: session_keys(1),
@@ -114,7 +112,7 @@ fn a_tampered_ticket_fails_authentication() {
     let now = Timestamp::ZERO;
 
     let ticket = Ticket {
-        expires_at: now.saturating_add(Duration::from_secs(60)),
+        expires_at: now.saturating_add(Span::from_secs(60)),
         client_id: 1,
         session: None,
         keys: session_keys(1),
@@ -149,7 +147,7 @@ fn a_cookie_binds_the_address_that_presented_the_ticket() {
     let now = Timestamp::ZERO;
 
     let ticket = Ticket {
-        expires_at: now.saturating_add(Duration::from_secs(60)),
+        expires_at: now.saturating_add(Span::from_secs(60)),
         client_id: 99,
         session: Some(SessionId::new(3, ShardId::FIRST)),
         keys: session_keys(99),
@@ -204,7 +202,7 @@ fn a_cookie_carries_a_full_user_data_payload() {
     assert!(user_data.extend_from_slice(&[0xC3; MAX_USER_DATA]));
 
     let ticket = Ticket {
-        expires_at: now.saturating_add(Duration::from_secs(60)),
+        expires_at: now.saturating_add(Span::from_secs(60)),
         client_id: u64::MAX,
         session: Some(SessionId::new(u64::MAX, ShardId::FIRST)),
         keys: session_keys(5),
@@ -242,7 +240,7 @@ fn a_cookie_from_another_server_is_rejected() {
     let now = Timestamp::ZERO;
 
     let ticket = Ticket {
-        expires_at: now.saturating_add(Duration::from_secs(60)),
+        expires_at: now.saturating_add(Span::from_secs(60)),
         client_id: 1,
         session: None,
         keys: session_keys(1),
@@ -379,7 +377,7 @@ fn every_payload_header_carries_the_connection_id_the_server_assigned() {
     // shard. What matters is that both directions carry the one the server
     // assigned, since the server routes by it.
     let assigned = pair.server.connections()[0].id();
-    
+
     assert_eq!(pair.client.connection().expect("connected").id(), assigned);
     let payloads: Vec<_> = pair
         .trace
@@ -450,7 +448,7 @@ fn ordered_messages_arrive_in_order() {
     for n in 0..16u32 {
         pair.client_send(0, &n.to_le_bytes());
     }
-    assert!(pair.run_until(Duration::from_millis(16), |p| p.server_inbox.len() >= 16));
+    assert!(pair.run_until(Span::from_millis(16), |p| p.server_inbox.len() >= 16));
 
     for (n, (channel, payload)) in pair.server_inbox.iter().enumerate() {
         assert_eq!(*channel, 0);
@@ -466,7 +464,7 @@ fn a_reliable_message_is_acknowledged_and_sent_once() {
 
     let before = pair.trace.len();
     pair.client_send(0, b"once");
-    assert!(pair.run_until(Duration::from_millis(16), |p| !p.server_inbox.is_empty()));
+    assert!(pair.run_until(Span::from_millis(16), |p| !p.server_inbox.is_empty()));
     assert!(pair.settle());
 
     assert_eq!(pair.server_inbox.len(), 1, "delivered exactly once");
@@ -485,7 +483,7 @@ fn an_idle_connection_exchanges_keepalives() {
     let before = pair.trace.len();
     // Past the one-second keepalive interval, well short of the ten-second
     // idle timeout.
-    pair.advance(Duration::from_millis(1100));
+    pair.advance(Span::from_millis(1100));
     assert!(pair.settle());
 
     assert!(
@@ -503,7 +501,7 @@ fn an_idle_connection_survives_well_past_the_timeout() {
 
     // Thirty seconds of no application traffic at all.
     for _ in 0..30 {
-        pair.advance(Duration::from_secs(1));
+        pair.advance(Span::from_secs(1));
         assert!(pair.settle());
     }
 
@@ -521,7 +519,7 @@ fn a_silent_client_is_timed_out_and_its_session_suspended() {
     pair.silence_client(true);
 
     for _ in 0..12 {
-        pair.advance(Duration::from_secs(1));
+        pair.advance(Span::from_secs(1));
         assert!(pair.settle());
     }
 

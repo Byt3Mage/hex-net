@@ -6,7 +6,6 @@ use std::{
     hash::{BuildHasher, RandomState},
     marker::PhantomData,
     net::{IpAddr, SocketAddr},
-    time::Duration,
 };
 
 use crate::{
@@ -22,7 +21,7 @@ use crate::{
     shard::{Shard, ShardId},
     slab::{Handle, Slab},
     stats::Counter,
-    time::Timestamp,
+    time::{Span, Timestamp},
     timer::TimerHeap,
     wire::{
         ConnectionId, HANDSHAKE_LEN, Header, PacketKind, ServerNonce, encode_challenge, owner_shard, request_nonce,
@@ -42,7 +41,7 @@ struct PerAddress;
 
 impl RefillPolicy for PerAddress {
     const BURST: u32 = 32;
-    const INTERVAL: Duration = Duration::from_micros(62500);
+    const INTERVAL: Span = Span::from_micros(62500);
 }
 
 /// Handshake requests processed per second across all sources, bounding the
@@ -53,7 +52,7 @@ struct GlobalRequests;
 
 impl RefillPolicy for GlobalRequests {
     const BURST: u32 = 1024;
-    const INTERVAL: Duration = Duration::from_micros(125);
+    const INTERVAL: Span = Span::from_micros(125);
 }
 
 /// The same bound for cookie echoes, held separately. A response proves its
@@ -63,7 +62,7 @@ struct GlobalResponses;
 
 impl RefillPolicy for GlobalResponses {
     const BURST: u32 = GlobalRequests::BURST;
-    const INTERVAL: Duration = GlobalRequests::INTERVAL;
+    const INTERVAL: Span = GlobalRequests::INTERVAL;
 }
 
 /// How many closures or expiries are processed per pass. The remainder is picked
@@ -539,7 +538,7 @@ impl Endpoint {
         if cookie.addr != from {
             return Action::Dropped(DropReason::Handshake(HandshakeError::AddressMismatch));
         }
-        if ctx.now.saturating_since(cookie.issued_at) > COOKIE_LIFETIME {
+        if ctx.now.since(cookie.issued_at) > COOKIE_LIFETIME {
             return Action::Dropped(DropReason::Handshake(HandshakeError::Expired));
         }
 
@@ -664,7 +663,7 @@ impl Endpoint {
             // noticed it was gone (usually in a crash). The new connection takes
             // over the session.
             SessionState::Live(_) => Ok(()),
-            SessionState::Suspended { since } if now.saturating_since(since) < RESUME_GRACE => Ok(()),
+            SessionState::Suspended { since } if now.since(since) < RESUME_GRACE => Ok(()),
             SessionState::Suspended { .. } => Err(HandshakeError::NoSession),
         }
     }
@@ -849,7 +848,7 @@ impl Endpoint {
 
         while (expired < REAP_BATCH)
             && let Some(&(since, session)) = self.suspended.front()
-            && (now.saturating_since(since) >= RESUME_GRACE)
+            && (now.since(since) >= RESUME_GRACE)
         {
             self.suspended.pop_front();
 
@@ -940,7 +939,7 @@ fn peek_kind(buf: &[u8], len: usize) -> Option<PacketKind> {
 /// whole life and cannot be refilled under another.
 trait RefillPolicy {
     const BURST: u32;
-    const INTERVAL: Duration;
+    const INTERVAL: Span;
 }
 
 struct Bucket<P> {
@@ -969,7 +968,7 @@ impl<P: RefillPolicy> Bucket<P> {
     /// advancing `last_refill` only by what was credited, unless the bucket
     /// filled, in which case waiting earns nothing further.
     fn refill(&mut self, now: Timestamp) {
-        let elapsed = now.saturating_since(self.last_refill).as_nanos();
+        let elapsed = now.since(self.last_refill).as_nanos();
         let intervals = elapsed / P::INTERVAL.as_nanos();
         if intervals == 0 {
             return;
@@ -979,7 +978,7 @@ impl<P: RefillPolicy> Bucket<P> {
         match u32::try_from(intervals) {
             Ok(intervals) if intervals < missing => {
                 self.tokens += intervals;
-                self.last_refill = self.last_refill.saturating_add(P::INTERVAL * intervals);
+                self.last_refill = self.last_refill.saturating_add(P::INTERVAL.saturating_mul(intervals));
             }
             _ => {
                 self.tokens = P::BURST;

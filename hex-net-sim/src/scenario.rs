@@ -9,19 +9,18 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt,
     net::SocketAddr,
-    time::Duration,
 };
 
 use hex_net_core::{
-    budget::BudgetConfig,
     channel::SendError,
+    config::BudgetConfig,
     connection::CloseReason,
     connector::{Connector, State},
     endpoint::{Endpoint, Event, ServerConnection},
     handshake::SessionId,
     slab::Handle,
     stats::{Counter, Counters},
-    time::Timestamp,
+    time::{Span, Timestamp},
 };
 use hex_net_io::driver::{ClientApp, ServerApp};
 
@@ -112,18 +111,18 @@ impl ServerApp for Echo {
 #[derive(Clone, Copy, Debug)]
 pub struct Pace {
     /// Gap between messages within a burst.
-    pub interval: Duration,
+    pub interval: Span,
     /// Messages per burst, or `None` for one unbroken stream.
     pub burst: Option<u32>,
     /// Quiet time after each burst. The last message of a burst is the tail
     /// the transport has nothing following it to detect a loss with.
-    pub gap: Duration,
+    pub gap: Span,
 }
 
 impl Pace {
     /// One message every `interval`, without pause.
-    pub const fn steady(interval: Duration) -> Pace {
-        Pace { interval, burst: None, gap: Duration::ZERO }
+    pub const fn steady(interval: Span) -> Pace {
+        Pace { interval, burst: None, gap: Span::ZERO }
     }
 }
 
@@ -138,12 +137,12 @@ pub struct Chatter {
     sent_at: Vec<Timestamp>,
     pub sent: u32,
     pub echoes: Vec<u32>,
-    pub round_trips: Vec<(u32, Duration)>,
+    pub round_trips: Vec<(u32, Span)>,
     pub states: Vec<State>,
 }
 
 impl Chatter {
-    pub fn new(id: usize, total: u32, interval: Duration) -> Self {
+    pub fn new(id: usize, total: u32, interval: Span) -> Self {
         Self::paced(id, total, Pace::steady(interval))
     }
 
@@ -177,7 +176,7 @@ impl ClientApp for Chatter {
         self.echoes.push(seq);
 
         if let Some(sent_at) = self.sent_at.get(seq as usize) {
-            self.round_trips.push((seq, at.saturating_since(*sent_at)));
+            self.round_trips.push((seq, at.since(*sent_at)));
         }
     }
 
@@ -207,7 +206,7 @@ impl ClientApp for Chatter {
         // A burst's last message is followed by silence, which is what makes
         // it a tail: nothing after it can reveal that it was lost.
         let tail = self.is_tail(self.sent.saturating_sub(1));
-        let wait = if tail { self.pace.interval + self.pace.gap } else { self.pace.interval };
+        let wait = if tail { self.pace.interval.saturating_add(self.pace.gap) } else { self.pace.interval };
         self.next_send = Some(now.saturating_add(wait));
     }
 
@@ -459,7 +458,7 @@ pub fn assert_clean(run: &impl Settled, total: u32) {
 #[derive(Clone, Debug)]
 pub struct Report {
     pub clients: usize,
-    pub simulated: Duration,
+    pub simulated: Span,
     /// Datagrams the wire carried, and how many it destroyed.
     pub datagrams: u64,
     pub lost_on_wire: u64,
@@ -471,28 +470,28 @@ pub struct Report {
     pub declared_lost: u64,
     pub spurious: u64,
     /// Round trips of every echo, sorted.
-    pub round_trips: Vec<Duration>,
+    pub round_trips: Vec<Span>,
     /// Round trips of echoes for a burst's last message, sorted. Nothing
     /// follows these, so only a probe can reveal that one was lost.
-    pub tail_round_trips: Vec<Duration>,
+    pub tail_round_trips: Vec<Span>,
     /// Clients that received every echo they were owed.
     pub complete: usize,
 }
 
 impl Report {
-    pub fn percentile(sorted: &[Duration], fraction: f64) -> Duration {
+    pub fn percentile(sorted: &[Span], fraction: f64) -> Span {
         if sorted.is_empty() {
-            return Duration::ZERO;
+            return Span::ZERO;
         }
         let last = sorted.len() - 1;
         sorted[((last as f64) * fraction) as usize]
     }
 
-    pub fn round_trip(&self, fraction: f64) -> Duration {
+    pub fn round_trip(&self, fraction: f64) -> Span {
         Self::percentile(&self.round_trips, fraction)
     }
 
-    pub fn tail_round_trip(&self, fraction: f64) -> Duration {
+    pub fn tail_round_trip(&self, fraction: f64) -> Span {
         Self::percentile(&self.tail_round_trips, fraction)
     }
 }
@@ -535,7 +534,7 @@ impl fmt::Display for Report {
 
 /// Measures a finished run. `simulated` is how long it covered, which sets
 /// the denominator for rates.
-pub fn report(world: &World<Echo, Chatter>, simulated: Duration, total: u32) -> Report {
+pub fn report(world: &World<Echo, Chatter>, simulated: Span, total: u32) -> Report {
     let counters = world.server().counters();
     let stats = world.wire_stats();
 

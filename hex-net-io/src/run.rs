@@ -12,12 +12,11 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
 
 use hex_net_core::{
     connector::State,
-    time::{Clock, Timestamp},
+    time::{Clock, Span, Timestamp},
 };
 
 use crate::{
@@ -102,12 +101,7 @@ where
 
 /// Closes every connection with a notice and keeps stepping until they have
 /// all been retired or `linger` has passed, so the notices go out.
-pub fn shutdown_server<S, A, C>(
-    driver: &mut ServerDriver<S>,
-    app: &mut A,
-    clock: &C,
-    linger: Duration,
-) -> io::Result<()>
+pub fn shutdown_server<S, A, C>(driver: &mut ServerDriver<S>, app: &mut A, clock: &C, linger: Span) -> io::Result<()>
 where
     S: Socket + Wait,
     A: ServerApp,
@@ -154,12 +148,7 @@ where
 
 /// Closes a client's connection with a notice and keeps stepping until it has
 /// closed or `linger` has passed. Returns the state it finished in.
-pub fn close_client<S, A, C>(
-    driver: &mut ClientDriver<S>,
-    app: &mut A,
-    clock: &C,
-    linger: Duration,
-) -> io::Result<State>
+pub fn close_client<S, A, C>(driver: &mut ClientDriver<S>, app: &mut A, clock: &C, linger: Span) -> io::Result<State>
 where
     S: Socket + Wait,
     A: ClientApp,
@@ -203,7 +192,7 @@ fn pause(socket: &impl Wait, clock: &impl Clock, deadline: Option<Timestamp>, no
 
     if now < not_before {
         let until = deadline.map_or(not_before, |at| at.min(not_before));
-        if socket.park(until.saturating_since(now))? {
+        if socket.park(until.since(now).as_duration())? {
             return Ok(());
         }
     }
@@ -212,7 +201,7 @@ fn pause(socket: &impl Wait, clock: &impl Clock, deadline: Option<Timestamp>, no
     let timeout = match deadline {
         None => None,
         Some(at) if at <= now => return Ok(()),
-        Some(at) => Some(at.saturating_since(now)),
+        Some(at) => Some(at.since(now).as_duration()),
     };
     socket.wait(timeout)
 }

@@ -3,16 +3,20 @@
 //! Everything that differs between the two sides is either associated state on
 //! the role or an inherent method on one instantiation, so a client connection
 //! has no path-validation state and a server connection has no received ticket.
+//!
+//! One rule holds the file together: `transmit_at` is the only judgement of
+//! whether a packet is owed. `poll_transmit` builds exactly when it is due and
+//! `next_timeout` reports it, so a deadline that has come always produces a
+//! packet and a driver woken by one cannot spin.
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use crate::{
     ack::{Delivery, Outgoing, Resolved, Rtt, decode_ack_delay, encode_ack_delay},
     bits::{BitReader, BitWriter, ReadError},
     budget::Budget,
     channel::{ChannelSet, Channels, OnMessage, PacketMessages, PacketRecord, SendError},
-    config::TransportConfig,
+    config::{Liveness, TransportConfig},
     crypto::{ConnectionKeys, Key, MAX_BLOB},
     ctx::Ctx,
     fixed::RingQueue,
@@ -20,16 +24,9 @@ use crate::{
     packet::{DecryptError, Packet, PacketCrypto},
     seq::{Sequence, WindowError},
     stats::{Counter, Counters},
-    time::Timestamp,
+    time::{Span, Timestamp},
     wire::{ConnectionId, ControlKind, FrameKind, Header, PacketKind, TAG_LEN},
 };
-
-/// No packet received for this long and the connection is dead.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Minimum send rate, which holds NAT mappings open and gives the peer a steady
-/// liveness signal.
-pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A close notice is unreliable, so it goes out more than once.
 const CLOSE_SENDS: u8 = 3;
@@ -40,7 +37,7 @@ const CLOSE_SENDS: u8 = 3;
 const PROBE_MESSAGES: usize = 2;
 
 /// How long an unproven path is probed before it is abandoned.
-const PATH_TIMEOUT: Duration = Duration::from_secs(3);
+const PATH_TIMEOUT: Span = Span::from_secs(3);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(u8)]
@@ -110,6 +107,198 @@ enum Lifecycle {
     Closed,
 }
 
+/// What this side owes the peer in acknowledgements.
+///
+/// Three states rather than an instant beside a flag, so "owed, not yet due,
+/// and also due at once" cannot be written down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AckOwed {
+    /// Nothing worth acknowledging has arrived since the last packet went out.
+    Nothing,
+    /// Owed since this instant, held until the delay is up so it can ride on a
+    /// packet that has frames to carry.
+    Held(Timestamp),
+    /// Owed without delay: a packet arrived out of order, so this
+    /// acknowledgement is what tells the peer which of its packets are missing,
+    /// and holding it holds up every retransmission it would prompt.
+    AtOnce,
+}
+
+impl AckOwed {
+    /// Records an arriving ack-eliciting packet. The first one starts the
+    /// holding period; one out of order ends it.
+    #[inline]
+    fn record(&mut self, now: Timestamp, in_order: bool) {
+        *self = match (*self, in_order) {
+            (_, false) | (AckOwed::AtOnce, _) => AckOwed::AtOnce,
+            (AckOwed::Nothing, true) => AckOwed::Held(now),
+            (held, true) => held,
+        };
+    }
+
+    /// When this acknowledgement must go out even with nothing to carry it.
+    #[inline]
+    fn deadline(self, delay: Span) -> Option<Timestamp> {
+        match self {
+            AckOwed::Nothing => None,
+            AckOwed::AtOnce => Some(Timestamp::ZERO),
+            AckOwed::Held(since) => Some(since.saturating_add(delay)),
+        }
+    }
+}
+
+/// Which control frames are waiting for a packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Owed(u8);
+
+impl Owed {
+    const NONE: Owed = Owed(0);
+    const ACCEPTED: Owed = Owed(1 << 0);
+    const PATH_CHALLENGE: Owed = Owed(1 << 1);
+    const PATH_RESPONSE: Owed = Owed(1 << 2);
+    const RESUME_TICKET: Owed = Owed(1 << 3);
+
+    #[inline]
+    const fn contains(self, flag: Owed) -> bool {
+        (self.0 & flag.0) == flag.0
+    }
+
+    #[inline]
+    fn insert(&mut self, flag: Owed) {
+        self.0 |= flag.0;
+    }
+
+    #[inline]
+    fn remove(&mut self, flag: Owed) {
+        self.0 &= !flag.0;
+    }
+
+    #[inline]
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// Control frames queued for the next packet.
+///
+/// One flag per kind with its payload beside it, so asking twice for the same
+/// frame queues it once and "is any control owed" is one test of one byte.
+/// Nothing outside this type reads a payload, and each payload is written by
+/// the call that raises its flag, so a raised flag always has its frame.
+#[derive(Clone, Copy)]
+struct ControlQueue {
+    owed: Owed,
+    path_challenge: u64,
+    path_response: u64,
+    ticket: EncryptedTicket,
+}
+
+impl ControlQueue {
+    fn new() -> ControlQueue {
+        ControlQueue {
+            owed: Owed::NONE,
+            path_challenge: 0,
+            path_response: 0,
+            ticket: EncryptedTicket::new(),
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.owed.is_empty()
+    }
+
+    /// Server to client: this connection is established. Queued again for a
+    /// client whose acceptance was lost, which costs one frame.
+    fn queue_accept(&mut self) {
+        self.owed.insert(Owed::ACCEPTED);
+    }
+
+    /// Server to client: prove you receive at the address a packet came from.
+    fn queue_path_challenge(&mut self, token: u64) {
+        self.path_challenge = token;
+        self.owed.insert(Owed::PATH_CHALLENGE);
+    }
+
+    /// Client to server: the echo of a challenge.
+    fn queue_path_response(&mut self, token: u64) {
+        self.path_response = token;
+        self.owed.insert(Owed::PATH_RESPONSE);
+    }
+
+    /// Server to client: a sealed ticket for resuming this session. Only the
+    /// newest is useful, so a later one replaces a queued one.
+    fn queue_ticket(&mut self, ticket: EncryptedTicket) {
+        self.ticket = ticket;
+        self.owed.insert(Owed::RESUME_TICKET);
+    }
+
+    /// Writes what fits, smallest first. A frame that does not fit stays owed
+    /// for the next packet. Returns whether anything was written.
+    fn write(&mut self, w: &mut BitWriter) -> bool {
+        let mut wrote = false;
+
+        if self.owed.contains(Owed::ACCEPTED) && write_frame(w, ControlKind::Accepted, |_| true) {
+            self.owed.remove(Owed::ACCEPTED);
+            wrote = true;
+        }
+
+        if self.owed.contains(Owed::PATH_CHALLENGE) {
+            let token = self.path_challenge;
+            if write_frame(w, ControlKind::PathChallenge, |w| w.write_u64(token).is_ok()) {
+                self.owed.remove(Owed::PATH_CHALLENGE);
+                wrote = true;
+            }
+        }
+
+        if self.owed.contains(Owed::PATH_RESPONSE) {
+            let token = self.path_response;
+            if write_frame(w, ControlKind::PathResponse, |w| w.write_u64(token).is_ok()) {
+                self.owed.remove(Owed::PATH_RESPONSE);
+                wrote = true;
+            }
+        }
+
+        if self.owed.contains(Owed::RESUME_TICKET) {
+            let ticket = self.ticket;
+            let written = write_frame(w, ControlKind::ResumeTicket, |w| {
+                w.write_range(ticket.len() as u32, 0, MAX_BLOB as u32).is_ok()
+                    && w.align().is_ok()
+                    && w.write_bytes(&ticket).is_ok()
+            });
+            if written {
+                self.owed.remove(Owed::RESUME_TICKET);
+                wrote = true;
+            }
+        }
+
+        wrote
+    }
+}
+
+/// Writes one control frame, leaving the packet as it was if any part of it
+/// does not fit.
+fn write_frame(w: &mut BitWriter, kind: ControlKind, body: impl FnOnce(&mut BitWriter) -> bool) -> bool {
+    let at = w.checkpoint();
+    let ok = FrameKind::Control.write(w).is_ok() && kind.write(w).is_ok() && body(w);
+    if !ok {
+        w.rollback(at);
+    }
+    ok
+}
+
+/// The resume ticket a client holds, and whether the application has seen it.
+///
+/// Whether one is waiting lives in the state rather than in a flag beside an
+/// option, so a ticket cannot be both unread and absent.
+#[derive(Clone, Copy)]
+#[allow(clippy::large_enum_variant)]
+enum ResumeTicket {
+    None,
+    Unread(EncryptedTicket),
+    Read,
+}
+
 mod sealed {
     pub trait Sealed {}
     impl Sealed for super::Client {}
@@ -133,9 +322,6 @@ pub trait Role: Sized + sealed::Sealed {
         r: &mut BitReader,
     ) -> Result<(), ReadError>;
 
-    /// Writes this side's control frames. Returns whether anything was written.
-    fn write_control(conn: &mut Connection<Self>, w: &mut BitWriter) -> bool;
-
     /// one.
     fn on_address_change(conn: &mut Connection<Self>, now: Timestamp, from: SocketAddr, sequence: Sequence);
 
@@ -149,22 +335,14 @@ pub trait Role: Sized + sealed::Sealed {
 /// Identifies the server by address, so it never validates paths. It answers
 /// challenges rather than issuing them.
 pub struct Client {
-    /// Set when a ticket arrives, cleared when the application takes it.
-    ticket_unread: bool,
-    /// A challenge token awaiting its echo.
-    pending_path_response: Option<u64>,
+    ticket: ResumeTicket,
 }
 
 /// Validates any address change before trusting it, and issues resume tickets.
 pub struct Server {
     session: SessionId,
-    /// The sealed ticket this connection was accepted from, so the endpoint can
-    /// mark it spent when the connection ends.
     ticket: TicketId,
-    /// Queued until the acceptance frame has gone out.
-    pending_accept: bool,
     probe: Option<Probe>,
-    pending_path_challenge: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -178,31 +356,20 @@ struct Probe {
 /// them in parallel without locks. Never touches a socket.
 pub struct Connection<R: Role> {
     id: ConnectionId,
-    /// Where packets are sent. Changes only after path validation.
     addr: SocketAddr,
     lifecycle: Lifecycle,
-
-    /// - Server: A ticket queued for delivery.
-    /// - Client: The most recent ticket the server sent.
-    ticket: Option<EncryptedTicket>,
 
     crypto: PacketCrypto,
     delivery: Delivery<PacketRecord>,
     budget: Budget,
     channels: Channels,
+    control: ControlQueue,
 
-    /// When the first packet still awaiting acknowledgement arrived, which is
-    /// what `ack_delay` is measured from.
-    ack_pending: Option<Timestamp>,
-
+    ack: AckOwed,
     /// Longest an acknowledgement is held for a packet with frames to carry it.
-    /// Past that it goes out on a packet of its own.
-    ack_delay: Duration,
-
-    /// A packet arrived out of order, so the acknowledgement owed is not held
-    /// at all: it is what tells the peer which packets are missing, and delay
-    /// there is delay in every retransmission it prompts.
-    ack_immediately: bool,
+    ack_delay: Span,
+    /// How long silence may last, and how often it is broken.
+    liveness: Liveness,
 
     last_received: Timestamp,
 
@@ -210,7 +377,6 @@ pub struct Connection<R: Role> {
     /// ledger asked for. One per packet, since each must be separately
     /// losable to be worth sending.
     pending_probes: u8,
-
     events: RingQueue<Event, 16>,
     role: R,
 }
@@ -226,19 +392,18 @@ impl<R: Role> Connection<R> {
         role: R,
     ) -> Self {
         let (tx, rx) = R::split_keys(keys);
-
         Self {
             id,
             addr,
             lifecycle: Lifecycle::Open,
-            ticket: None,
             crypto: PacketCrypto::new(id, &tx, &rx),
             delivery: Delivery::new(now, transport.max_ack_delay),
             budget: Budget::new(now, transport.budget),
             channels: Channels::new(channels),
-            ack_pending: None,
+            control: ControlQueue::new(),
+            ack: AckOwed::Nothing,
             ack_delay: transport.max_ack_delay.get(),
-            ack_immediately: false,
+            liveness: transport.liveness,
             last_received: now,
             pending_probes: 0,
             events: RingQueue::new(),
@@ -352,10 +517,7 @@ impl<R: Role> Connection<R> {
 
         if eliciting {
             self.crypto.record_eliciting(opened.sequence, ctx.now);
-            if self.ack_pending.is_none() {
-                self.ack_pending = Some(ctx.now);
-            }
-            self.ack_immediately |= !opened.in_order;
+            self.ack.record(ctx.now, opened.in_order);
         }
 
         if from != self.addr {
@@ -410,6 +572,42 @@ impl<R: Role> Connection<R> {
         }
     }
 
+    /// When a packet is owed, or `None` while none is.
+    ///
+    /// The only judgement of whether there is anything to send. A control frame,
+    /// a close notice and a probe are due as soon as they are queued; an
+    /// acknowledgement waits out its delay; channel data waits for the budget.
+    fn transmit_at(&self) -> Option<Timestamp> {
+        if self.lifecycle == Lifecycle::Closed {
+            return None;
+        }
+
+        if (self.pending_probes > 0) || matches!(self.lifecycle, Lifecycle::Closing { .. }) || !self.control.is_empty()
+        {
+            return Some(Timestamp::ZERO);
+        }
+
+        let ack = self.ack.deadline(self.ack_delay);
+
+        // Only an open connection writes channel frames, so only an open one is
+        // woken to send them. The message that goes first is the only one that
+        // can go next, so its size alone decides when sending resumes.
+        let data = match self.lifecycle {
+            Lifecycle::Open => self.channels.next_unsent_len().map(|len| self.budget.ready_for(len)),
+            Lifecycle::Closing { .. } | Lifecycle::Closed => None,
+        };
+
+        match (ack, data) {
+            (Some(ack), Some(data)) => Some(ack.min(data)),
+            (ack, data) => ack.or(data),
+        }
+    }
+
+    #[inline]
+    fn transmit_due(&self, now: Timestamp) -> bool {
+        self.transmit_at().is_some_and(|at| at <= now)
+    }
+
     /// Builds the next packet, if there is one. Returns its length in `buf`.
     ///
     /// One packet per call. Coalescing everything for a peer into a single
@@ -420,11 +618,12 @@ impl<R: Role> Connection<R> {
     /// `ack_delay`. Until then it waits for a packet with frames to ride on,
     /// which at game rates is usually the next one the application sends.
     pub fn poll_transmit(&mut self, ctx: &mut Ctx, out: &mut Packet) -> Option<usize> {
-        if self.lifecycle == Lifecycle::Closed {
+        self.budget.assess(ctx.now, self.delivery.rtt());
+
+        if !self.transmit_due(ctx.now) {
             return None;
         }
 
-        self.budget.assess(ctx.now, self.delivery.rtt());
         let allowance = self.budget.available(ctx.now) as usize;
 
         // A probe has to go out regardless, so it carries the messages whose
@@ -457,10 +656,9 @@ impl<R: Role> Connection<R> {
             eliciting |= self.channels.write_frames(&mut w, &mut staged, channel_limit);
         }
 
-        if !eliciting && self.ack_due(ctx.now) {
-            // Nothing to say, and any acknowledgement owed can still wait for
-            // a packet that has. Keepalives come from the timer, which queues
-            // a ping.
+        if !eliciting && !self.ack_due(ctx.now) {
+            // The packet would carry a header and a tag and nothing else, which
+            // the peer cannot act on. Whatever is owed stays owed.
             self.channels.on_packet_aborted(staged);
             return None;
         }
@@ -480,8 +678,9 @@ impl<R: Role> Connection<R> {
             apply_resolution(&mut self.channels, &mut self.budget, ctx.counters, resolved)
         });
         self.budget.on_sent(sealed.datagram_len(), eliciting);
-        self.ack_pending = None;
-        self.ack_immediately = false;
+        // Every header reports the whole ack state,
+        // so anything owed has now gone out.
+        self.ack = AckOwed::Nothing;
 
         if eliciting {
             ctx.counters.inc(Counter::PacketsTracked);
@@ -505,28 +704,18 @@ impl<R: Role> Connection<R> {
     /// An acknowledgement is owed and has been held as long as it may be.
     #[inline]
     fn ack_due(&self, now: Timestamp) -> bool {
-        self.ack_pending
-            .is_some_and(|since| self.ack_immediately || now >= since.saturating_add(self.ack_delay))
-    }
-
-    /// When the acknowledgement owed, if any, must go out however little else
-    /// there is to carry it.
-    #[inline]
-    fn ack_deadline(&self) -> Option<Timestamp> {
-        let since = self.ack_pending?;
-        Some(if self.ack_immediately { Timestamp::ZERO } else { since.saturating_add(self.ack_delay) })
+        self.ack.deadline(self.ack_delay).is_some_and(|at| at <= now)
     }
 
     fn build_header(&self, now: Timestamp, sequence: Sequence) -> Header {
         let (ack, ack_delay, ack_bits) = match self.crypto.ack_state() {
             Some(state) => (
                 Some(state.newest.to_wire()),
-                encode_ack_delay(now.saturating_since(state.received_at)),
+                encode_ack_delay(now.since(state.received_at)),
                 state.bits,
             ),
             None => (None, 0, 0),
         };
-
         Header {
             kind: PacketKind::Payload,
             conn_id: self.id,
@@ -541,7 +730,7 @@ impl<R: Role> Connection<R> {
     /// that does not fit is left queued for the next packet.
     fn write_control(&mut self, w: &mut BitWriter) -> bool {
         let mut wrote = self.write_close(w);
-        wrote |= R::write_control(self, w);
+        wrote |= self.control.write(w);
         wrote |= self.write_ping(w);
         wrote
     }
@@ -550,14 +739,9 @@ impl<R: Role> Connection<R> {
         let Lifecycle::Closing { reason, .. } = self.lifecycle else {
             return false;
         };
-        let at = w.checkpoint();
-        let ok = FrameKind::Control.write(w).is_ok()
-            && ControlKind::Close.write(w).is_ok()
-            && w.write_bits(reason as u32, CloseReason::BITS).is_ok();
-        if !ok {
-            w.rollback(at);
-        }
-        ok
+        write_frame(w, ControlKind::Close, |w| {
+            w.write_bits(reason as u32, CloseReason::BITS).is_ok()
+        })
     }
 
     /// Writes the frame that makes a probe or keepalive ack-eliciting.
@@ -566,17 +750,11 @@ impl<R: Role> Connection<R> {
     /// costs a few bits and guarantees the packet elicits an acknowledgement
     /// whatever the budget allows the channels to add.
     fn write_ping(&mut self, w: &mut BitWriter) -> bool {
-        if self.pending_probes == 0 {
-            return false;
-        }
-        let at = w.checkpoint();
-        let ok = FrameKind::Control.write(w).is_ok() && ControlKind::Ping.write(w).is_ok();
-        if ok {
+        if self.pending_probes != 0 && write_frame(w, ControlKind::Ping, |_| true) {
             self.pending_probes -= 1;
-        } else {
-            w.rollback(at);
+            return true;
         }
-        ok
+        false
     }
 
     /// Tracked packets whose outcome is still unknown.
@@ -598,7 +776,7 @@ impl<R: Role> Connection<R> {
             return;
         }
 
-        if ctx.now.saturating_since(self.last_received) >= IDLE_TIMEOUT {
+        if ctx.now.since(self.last_received) >= self.liveness.idle_timeout() {
             self.lifecycle = Lifecycle::Closed;
             self.events.push(Event::Closed(CloseReason::TimedOut));
             return;
@@ -612,7 +790,7 @@ impl<R: Role> Connection<R> {
             self.pending_probes = self.pending_probes.max(probe.packets);
         }
 
-        if ctx.now.saturating_since(self.delivery.last_eliciting()) >= KEEPALIVE_INTERVAL {
+        if ctx.now.since(self.delivery.last_eliciting()) >= self.liveness.keepalive() {
             self.pending_probes = self.pending_probes.max(1);
         }
 
@@ -627,32 +805,17 @@ impl<R: Role> Connection<R> {
             return None;
         }
 
-        // Probes still owed are due at once, and each needs its own packet.
-        if self.pending_probes > 0 {
-            return Some(Timestamp::ZERO);
+        let mut earliest = self.last_received.saturating_add(self.liveness.idle_timeout());
+        if let Some(at) = self.transmit_at() {
+            earliest = earliest.min(at);
         }
-
-        let mut earliest = self.last_received.saturating_add(IDLE_TIMEOUT);
-
         if let Some(at) = self.delivery.next_timeout() {
             earliest = earliest.min(at);
         }
-        if let Some(at) = self.ack_deadline() {
-            earliest = earliest.min(at);
-        }
-
-        // Queued data waiting on the budget. Only an open connection writes
-        // channel frames, so only an open one is woken to send them.
-        if (self.lifecycle == Lifecycle::Open)
-            && let Some(len) = self.channels.next_unsent_len()
-        {
-            earliest = earliest.min(self.budget.ready_for(len))
-        }
-
         if let Some(at) = R::next_deadline(self) {
             earliest = earliest.min(at);
         }
-        earliest = earliest.min(self.delivery.last_eliciting().saturating_add(KEEPALIVE_INTERVAL));
+        earliest = earliest.min(self.delivery.last_eliciting().saturating_add(self.liveness.keepalive()));
 
         Some(earliest)
     }
@@ -672,7 +835,8 @@ impl Role for Client {
         let _ = now;
         match kind {
             ControlKind::PathChallenge => {
-                conn.role.pending_path_response = Some(r.read_u64()?);
+                let token = r.read_u64()?;
+                conn.control.queue_path_response(token);
                 Ok(())
             }
 
@@ -682,10 +846,8 @@ impl Role for Client {
                 let bytes = r.peek_bytes(len).ok_or(ReadError::Eof)?;
                 let received = EncryptedTicket::from_slice(bytes).ok_or(ReadError::OutOfRange)?;
                 r.skip_bytes(len)?;
-
                 // Only the newest ticket is useful.
-                conn.ticket = Some(received);
-                conn.role.ticket_unread = true;
+                conn.role.ticket = ResumeTicket::Unread(received);
                 conn.events.push(Event::ResumeTicketReceived);
                 Ok(())
             }
@@ -697,18 +859,6 @@ impl Role for Client {
             // Only a server receives a path response; Ping and Close never reach
             // here.
             _ => Err(ReadError::OutOfRange),
-        }
-    }
-
-    fn write_control(conn: &mut Connection<Self>, w: &mut BitWriter) -> bool {
-        let Some(token) = conn.role.pending_path_response else {
-            return false;
-        };
-        if write_control_u64(w, ControlKind::PathResponse, token) {
-            conn.role.pending_path_response = None;
-            true
-        } else {
-            false
         }
     }
 
@@ -740,7 +890,7 @@ impl Connection<Client> {
             keys,
             channels,
             transport,
-            Client { ticket_unread: false, pending_path_response: None },
+            Client { ticket: ResumeTicket::None },
         )
     }
 
@@ -750,11 +900,13 @@ impl Connection<Client> {
     /// Returns a copy and keeps it, so a caller that fails to persist it can ask
     /// again after the next arrival.
     pub fn take_resume_ticket(&mut self) -> Option<EncryptedTicket> {
-        if !self.role.ticket_unread {
-            return None;
+        match self.role.ticket {
+            ResumeTicket::Unread(ticket) => {
+                self.role.ticket = ResumeTicket::Read;
+                Some(ticket)
+            }
+            ResumeTicket::None | ResumeTicket::Read => None,
         }
-        self.role.ticket_unread = false;
-        self.ticket
     }
 }
 
@@ -791,45 +943,6 @@ impl Role for Server {
         }
     }
 
-    fn write_control(conn: &mut Connection<Self>, w: &mut BitWriter) -> bool {
-        let mut wrote = false;
-
-        if conn.role.pending_accept {
-            let at = w.checkpoint();
-            let ok = FrameKind::Control.write(w).is_ok() && ControlKind::Accepted.write(w).is_ok();
-            if ok {
-                conn.role.pending_accept = false;
-                wrote = true;
-            } else {
-                w.rollback(at);
-            }
-        }
-
-        if let Some(token) = conn.role.pending_path_challenge
-            && write_control_u64(w, ControlKind::PathChallenge, token)
-        {
-            conn.role.pending_path_challenge = None;
-            wrote = true;
-        }
-
-        if let Some(queued) = conn.ticket {
-            let at = w.checkpoint();
-            let ok = FrameKind::Control.write(w).is_ok()
-                && ControlKind::ResumeTicket.write(w).is_ok()
-                && w.write_range(queued.len() as u32, 0, MAX_BLOB as u32).is_ok()
-                && w.align().is_ok()
-                && w.write_bytes(&queued).is_ok();
-            if ok {
-                conn.ticket = None;
-                wrote = true;
-            } else {
-                // Did not fit, so it stays queued for the next packet.
-                w.rollback(at);
-            }
-        }
-        wrote
-    }
-
     /// The new address is challenged while real traffic continues to the old
     /// one, so a packet replayed from a forged source cannot redirect the
     /// connection.
@@ -842,13 +955,13 @@ impl Role for Server {
 
         let token = sequence.get().wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ now.as_nanos().rotate_left(17);
         conn.role.probe = Some(Probe { addr: from, token, started: now });
-        conn.role.pending_path_challenge = Some(token);
+        conn.control.queue_path_challenge(token);
     }
 
     fn on_timeout(conn: &mut Connection<Self>, now: Timestamp) {
-        let Some(pending) = conn.role.probe else { return };
-        if now.saturating_since(pending.started) >= PATH_TIMEOUT {
-            // Unproven; the existing address keeps carrying traffic.
+        if let Some(pending) = conn.role.probe
+            && now.since(pending.started) >= PATH_TIMEOUT
+        {
             conn.role.probe = None;
         }
     }
@@ -878,20 +991,14 @@ impl Connection<Server> {
             keys,
             channels,
             transport,
-            Server {
-                session,
-                ticket,
-                pending_accept: true,
-                probe: None,
-                pending_path_challenge: None,
-            },
+            Server { session, ticket, probe: None },
         )
     }
 
     /// Queues the acceptance frame again, for a client that retried its
     /// handshake because the first acceptance was lost.
     pub fn resend_acceptance(&mut self) {
-        self.role.pending_accept = true;
+        self.control.queue_accept();
     }
 
     /// The session this connection serves. A client has no use for its own
@@ -917,20 +1024,8 @@ impl Connection<Server> {
     /// Queues a resume ticket for delivery. Call periodically so the client
     /// always holds a fresh one.
     pub fn send_resume_ticket(&mut self, ticket: EncryptedTicket) {
-        self.ticket = Some(ticket);
+        self.control.queue_ticket(ticket);
     }
-}
-
-fn write_control_u64(w: &mut BitWriter, kind: ControlKind, value: u64) -> bool {
-    let at = w.checkpoint();
-    let ok = FrameKind::Control.write(w).is_ok()
-        && kind.write(w).is_ok()
-        && w.write_bits(value as u32, 32).is_ok()
-        && w.write_bits((value >> 32) as u32, 32).is_ok();
-    if !ok {
-        w.rollback(at);
-    }
-    ok
 }
 
 fn apply_resolution(

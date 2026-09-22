@@ -1,12 +1,10 @@
 //! The send allowance: its bounds, its refill, and its controller.
 
-use std::time::Duration;
-
 use crate::ack::{Delivery, Outgoing, Rtt};
-use crate::budget::{Budget, BudgetConfig, MIN_PACKET, MIN_RATE};
-use crate::config::MaxAckDelay;
+use crate::budget::Budget;
+use crate::config::{BudgetConfig, MIN_PACKET, MIN_RATE, MaxAckDelay};
 use crate::seq::Sequence;
-use crate::time::Timestamp;
+use crate::time::{Span, Timestamp};
 use crate::wire::MAX_DATAGRAM;
 
 fn at_micros(us: u64) -> Timestamp {
@@ -57,7 +55,7 @@ fn loss_backs_off_to_the_floor_and_recovers_to_the_ceiling() {
             budget.on_sent(100, true);
             budget.on_lost();
         }
-        now = now.saturating_add(Duration::from_millis(100));
+        now = now.saturating_add(Span::from_millis(100));
         budget.assess(now, &rtt);
         assert!(budget.rate() >= MIN_RATE);
     }
@@ -68,7 +66,7 @@ fn loss_backs_off_to_the_floor_and_recovers_to_the_ceiling() {
         for _ in 0..20 {
             budget.on_sent(100, true);
         }
-        now = now.saturating_add(Duration::from_millis(100));
+        now = now.saturating_add(Span::from_millis(100));
         budget.assess(now, &rtt);
         assert!(budget.rate() <= config.rate());
     }
@@ -90,7 +88,7 @@ fn acknowledgement_only_packets_do_not_dilute_the_loss_rate() {
         budget.on_sent(30, false);
     }
     budget.on_lost();
-    budget.assess(Timestamp::ZERO.saturating_add(Duration::from_millis(100)), &rtt);
+    budget.assess(Timestamp::ZERO.saturating_add(Span::from_millis(100)), &rtt);
     assert!(budget.is_constrained());
 }
 
@@ -107,8 +105,8 @@ fn jitter_on_a_short_path_is_not_queueing() {
         let rtt = if (n % 2) == 0 { 10 } else { 16 };
         let sequence = Sequence::new(n).expect("nonzero");
         delivery.on_sent(now, sequence, Outgoing::Eliciting(()), |_| {});
-        now = now.saturating_add(Duration::from_millis(rtt));
-        delivery.on_ack(now, sequence, Some(Duration::ZERO), 0, |_| {});
+        now = now.saturating_add(Span::from_millis(rtt));
+        delivery.on_ack(now, sequence, Some(Span::ZERO), 0, |_| {});
         budget.on_sent(100, true);
         budget.assess(now, delivery.rtt());
     }
