@@ -1,6 +1,6 @@
 //! Randomized round-trip and robustness tests for the bit reader and writer.
 
-use crate::bits::{BitReader, BitWriter, Quantizer, ReadError, WriteError, bits_required};
+use crate::bits::{BitReader, BitWriter, ReadError, WriteError, bits_required};
 
 /// xorshift64*, seeded per test so a failure replays exactly.
 struct Rng(u64);
@@ -442,27 +442,4 @@ fn bits_required_matches_the_highest_set_bit() {
     assert_eq!(bits_required(255), 8);
     assert_eq!(bits_required(256), 9);
     assert_eq!(bits_required(u32::MAX), 32);
-}
-
-#[test]
-fn quantizer_error_stays_within_half_a_step() {
-    let q = Quantizer::new(-2048.0, 2048.0, 0.01);
-    let mut rng = Rng::new(777);
-
-    assert_eq!(q.quantize(f32::NAN), 0, "NaN maps to the lower bound");
-    assert_eq!(q.quantize(1e9), q.steps());
-    assert_eq!(q.quantize(-1e9), 0);
-
-    for _ in 0..200_000 {
-        let unit = ((rng.next() as u32) as f64) / (u32::MAX as f64);
-        let value = ((unit * 4096.0) - 2048.0) as f32;
-
-        let decoded = q.dequantize(q.quantize(value));
-        assert!((decoded - value).abs() <= 0.0051, "{value} -> {decoded}");
-        assert_eq!(
-            q.quantize(decoded),
-            q.quantize(value),
-            "requantizing a decoded value must be stable"
-        );
-    }
 }

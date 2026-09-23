@@ -4,13 +4,13 @@
 //! arrive out of order. Fixed blocks chained by index give deterministic
 //! allocation with no fragmentation and no heap traffic.
 //!
-//! One arena per direction per connection. Sized by bytes outstanding —
-//! bandwidth times round trip — not by a message count, since many small
-//! messages and few large ones cost the same.
+//! One arena per direction per connection. Sized by bytes outstanding
+//! (`bandwidth x round trip`), since many small messages and few large ones
+//! cost the same.
 
 use std::array;
 
-/// Bytes per block. Most messages fit in one; the waste on a short message
+/// Bytes per block. Most messages fit in one. The waste on a short message
 /// is bounded by this, and the chain walk on a long one is short.
 pub const BLOCK: usize = 64;
 
@@ -21,28 +21,28 @@ const NONE: u16 = u16::MAX;
 /// Four bytes, so the structures that reference messages stay small enough to
 /// hold many of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MessageRef {
-    first: u16,
-    len: u16,
+pub struct ByteRef {
+    start: u16,
+    count: u16,
 }
 
-impl MessageRef {
+impl ByteRef {
     /// A reference to nothing, distinguishable from a zero-length message.
-    pub const NONE: MessageRef = MessageRef { first: NONE, len: 0 };
+    pub const NONE: ByteRef = ByteRef { start: NONE, count: 0 };
 
     #[inline]
     pub const fn is_none(self) -> bool {
-        self.first == NONE
+        self.start == NONE
     }
 
     #[inline]
     pub const fn len(self) -> usize {
-        self.len as usize
+        self.count as usize
     }
 
     #[inline]
     pub const fn is_empty(self) -> bool {
-        self.len == 0
+        self.count == 0
     }
 }
 
@@ -95,7 +95,7 @@ impl<const N: usize> Arena<N> {
     /// Reserves space without writing. Returns `None` when there is not enough
     /// room, which is the backpressure signal: the application is producing
     /// faster than the connection can drain.
-    pub fn reserve(&mut self, len: usize) -> Option<MessageRef> {
+    pub fn reserve(&mut self, len: usize) -> Option<ByteRef> {
         if len > (u16::MAX as usize) {
             return None;
         }
@@ -120,7 +120,7 @@ impl<const N: usize> Arena<N> {
         }
 
         self.free_count -= needed as u16;
-        Some(MessageRef { first, len: len as u16 })
+        Some(ByteRef { start: first, count: len as u16 })
     }
 
     /// Writes into a reserved message at `offset`. Returns false when the write
@@ -128,7 +128,7 @@ impl<const N: usize> Arena<N> {
     ///
     /// Pieces may be written in any order, which is what fragment reassembly
     /// needs.
-    pub fn write_at(&mut self, message: MessageRef, offset: usize, bytes: &[u8]) -> bool {
+    pub fn write_at(&mut self, message: ByteRef, offset: usize, bytes: &[u8]) -> bool {
         if message.is_none() || (offset + bytes.len()) > message.len() {
             return false;
         }
@@ -138,7 +138,7 @@ impl<const N: usize> Arena<N> {
         }
 
         // Walk to the block holding `offset`.
-        let mut block = message.first;
+        let mut block = message.start;
         for _ in 0..(offset / BLOCK) {
             block = self.next[block as usize];
             if block == NONE {
@@ -162,7 +162,7 @@ impl<const N: usize> Arena<N> {
     }
 
     /// Reserves and fills in one step.
-    pub fn store(&mut self, payload: &[u8]) -> Option<MessageRef> {
+    pub fn store(&mut self, payload: &[u8]) -> Option<ByteRef> {
         let message = self.reserve(payload.len())?;
         if !self.write_at(message, 0, payload) {
             self.release(message);
@@ -173,12 +173,12 @@ impl<const N: usize> Arena<N> {
 
     /// Copies a stored message into `out`. Returns its length, or `None` when
     /// `out` is too small.
-    pub fn load(&self, message: MessageRef, out: &mut [u8]) -> Option<usize> {
+    pub fn load(&self, message: ByteRef, out: &mut [u8]) -> Option<usize> {
         if message.is_none() || (out.len() < message.len()) {
             return None;
         }
 
-        let mut block = message.first;
+        let mut block = message.start;
         let mut read = 0;
         while read < message.len() {
             if block == NONE {
@@ -193,12 +193,12 @@ impl<const N: usize> Arena<N> {
     }
 
     /// Returns a message's blocks to the free list.
-    pub fn release(&mut self, message: MessageRef) {
+    pub fn release(&mut self, message: ByteRef) {
         if message.is_none() {
             return;
         }
 
-        let mut block = message.first;
+        let mut block = message.start;
         loop {
             let following = self.next[block as usize];
             self.next[block as usize] = self.free_head;
@@ -214,10 +214,10 @@ impl<const N: usize> Arena<N> {
 
     /// Visits a message's blocks in order, for writing into a packet without
     /// staging it through an intermediate buffer.
-    pub fn chunks(&self, message: MessageRef) -> Chunks<'_, N> {
+    pub fn chunks(&self, message: ByteRef) -> Chunks<'_, N> {
         Chunks {
             arena: self,
-            block: message.first,
+            block: message.start,
             remaining: if message.is_none() { 0 } else { message.len() },
         }
     }

@@ -4,7 +4,7 @@
 //! head-of-line blocking applies only where a channel asked for it.
 
 use crate::{
-    arena::{Arena, MessageRef},
+    arena::{Arena, ByteRef},
     bits::{BitReader, BitWriter, ReadError, WriteError, bits_required},
     fixed::FixedVec,
     seq::{self, WireSequence},
@@ -139,6 +139,7 @@ pub struct ChannelSet {
 impl ChannelSet {
     pub const fn new<const N: usize>(kinds: [ChannelKind; N]) -> Self {
         const { assert!(N <= MAX_CHANNELS, "too many channels") };
+        const { assert!(MAX_CHANNELS <= u8::MAX as usize) };
 
         let mut set = [ChannelKind::Unreliable; MAX_CHANNELS];
         let mut i = 0;
@@ -152,8 +153,8 @@ impl ChannelSet {
     }
 
     #[inline]
-    pub const fn len(&self) -> usize {
-        self.len
+    pub const fn len(&self) -> u8 {
+        self.len as u8
     }
 
     #[inline]
@@ -183,9 +184,7 @@ pub enum SendError {
 struct Pending {
     channel: u8,
     id: MessageId,
-    message: MessageRef,
-    /// Set while the message rides in a packet whose fate is unknown. Cleared on
-    /// loss so it is written again.
+    bytes: ByteRef,
     in_flight: bool,
 }
 
@@ -193,7 +192,7 @@ struct Pending {
 struct Held {
     channel: u8,
     id: MessageId,
-    message: MessageRef,
+    bytes: ByteRef,
 }
 
 /// Per-channel receive state.
@@ -349,11 +348,11 @@ impl Channels {
             return Err(SendError::WouldBlock);
         }
 
-        let message = self.send_arena.store(payload).ok_or(SendError::WouldBlock)?;
+        let bytes = self.send_arena.store(payload).ok_or(SendError::WouldBlock)?;
         let id = self.next_ids[channel as usize];
 
-        if !self.pending.push(Pending { channel, id, message, in_flight: false }) {
-            self.send_arena.release(message);
+        if !self.pending.push(Pending { channel, id, bytes, in_flight: false }) {
+            self.send_arena.release(bytes);
             return Err(SendError::WouldBlock);
         }
         self.next_ids[channel as usize] = id.next();
@@ -397,11 +396,11 @@ impl Channels {
                     self.dropped_inbound += 1;
                     return Ok(());
                 }
-                let Some(message) = self.recv_arena.store(payload) else {
+                let Some(bytes) = self.recv_arena.store(payload) else {
                     self.dropped_inbound += 1;
                     return Ok(());
                 };
-                let _ = self.held.push(Held { channel, id, message });
+                let _ = self.held.push(Held { channel, id, bytes });
             }
         }
         Ok(())
@@ -425,7 +424,6 @@ impl Channels {
 
         match kind {
             ChannelKind::Unreliable => Accepted::Deliver,
-
             ChannelKind::UnreliableSequenced => {
                 // Older than what was delivered: a newer update has superseded
                 // it, so it carries nothing useful.
@@ -436,7 +434,6 @@ impl Channels {
                 state.has_newest = true;
                 Accepted::Deliver
             }
-
             ChannelKind::ReliableUnordered => {
                 if state.accept_unordered(id) {
                     Accepted::Deliver
@@ -444,7 +441,6 @@ impl Channels {
                     Accepted::Discard
                 }
             }
-
             ChannelKind::ReliableOrdered => {
                 let distance = id.distance_from(state.expected);
                 if distance < 0 {
@@ -454,7 +450,7 @@ impl Channels {
                 } else if distance == 0 {
                     state.expected = state.expected.next();
                     Accepted::Deliver
-                } else if self.held.iter().any(|e| (e.channel == channel) && (e.id == id)) {
+                } else if self.held.iter().any(|e| e.channel == channel && e.id == id) {
                     Accepted::Discard
                 } else {
                     Accepted::Hold
@@ -476,10 +472,10 @@ impl Channels {
             self.receivers[channel as usize].expected = entry.id.next();
             // Held messages outlived their packet, so this is the one inbound
             // path that copies.
-            if let Some(len) = self.recv_arena.load(entry.message, &mut staging) {
+            if let Some(len) = self.recv_arena.load(entry.bytes, &mut staging) {
                 on_message(channel, &staging[..len]);
             }
-            self.recv_arena.release(entry.message);
+            self.recv_arena.release(entry.bytes);
             let Some(next) = self.next_held(channel) else { return };
             at = next;
         }
@@ -499,15 +495,11 @@ impl Channels {
     pub fn write_frames(&mut self, w: &mut BitWriter, staged: &mut PacketMessages, limit: usize) -> bool {
         let start_bits = w.bits_written();
         let mut wrote = false;
-
-        'channels: for channel in 0..(self.set.len() as u8) {
+        'channels: for channel in 0..self.set.len() {
             let Some(kind) = self.kind(channel) else { continue };
 
             loop {
-                if staged.is_full() {
-                    break 'channels;
-                }
-                if (w.bits_written() - start_bits).div_ceil(8) >= limit {
+                if staged.is_full() || (w.bits_written() - start_bits).div_ceil(8) >= limit {
                     break 'channels;
                 }
 
@@ -541,7 +533,6 @@ impl Channels {
                 wrote = true;
             }
         }
-
         wrote
     }
 
@@ -550,15 +541,13 @@ impl Channels {
     /// packet.
     pub fn on_packet_sent(&mut self, staged: PacketMessages) -> PacketRecord {
         let mut record = PacketRecord::new();
-
-        staged.iter().for_each(|msg| {
+        for msg in staged.iter() {
             if msg.reliable {
                 let _ = record.push(MessageKey { channel: msg.channel, id: msg.id });
             } else {
                 self.release_pending(msg.channel, msg.id);
             }
-        });
-
+        }
         record
     }
 
@@ -624,11 +613,11 @@ impl Channels {
     /// first, and a message that does not fit the allowance ends the attempt.
     /// So this message's size alone decides when sending can resume.
     pub fn next_unsent_len(&self) -> Option<usize> {
-        (0..(self.set.len() as u8)).find_map(|channel| {
+        (0..self.set.len()).find_map(|channel| {
             self.pending
                 .iter()
                 .find(|m| (m.channel == channel) && !m.in_flight)
-                .map(|m| m.message.len())
+                .map(|m| m.bytes.len())
         })
     }
 
@@ -636,12 +625,11 @@ impl Channels {
     /// reliable message is acknowledged and when an unreliable one's packet
     /// commits. In both cases the message has no further outcome.
     fn release_pending(&mut self, channel: u8, id: MessageId) {
-        let Some(at) = self.pending.iter().position(|m| (m.channel == channel) && (m.id == id)) else {
-            return;
+        if let Some(at) = self.pending.iter().position(|m| (m.channel == channel) && (m.id == id))
+            && let Some(outbound) = self.pending.remove(at)
+        {
+            self.send_arena.release(outbound.bytes);
         };
-        if let Some(outbound) = self.pending.remove(at) {
-            self.send_arena.release(outbound.message);
-        }
     }
 
     /// A lost message returns to the queue and goes out in a new packet under a
@@ -665,9 +653,9 @@ fn write_message_frame<const N: usize>(
     if kind.needs_id() {
         w.write_bits(u32::from(pending.id.to_wire().0), MESSAGE_ID_BITS)?;
     }
-    w.write_range(pending.message.len() as u32, 0, MAX_MESSAGE as u32)?;
+    w.write_range(pending.bytes.len() as u32, 0, MAX_MESSAGE as u32)?;
     // Byte-aligned so the payload copies as blocks rather than bit by bit. The
     // cost is under a byte of padding per message.
     w.align()?;
-    arena.chunks(pending.message).try_for_each(|c| w.write_bytes(c))
+    arena.chunks(pending.bytes).try_for_each(|c| w.write_bytes(c))
 }

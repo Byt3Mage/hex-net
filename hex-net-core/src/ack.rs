@@ -129,17 +129,17 @@ struct Sent<P> {
 /// The window is a type parameter, so the two the estimator keeps cannot be
 /// confused for one another and neither carries its length at runtime.
 #[derive(Clone, Copy, Debug)]
-struct WindowedMin<const WINDOW_NANOS: u64> {
+struct WindowedMin<const NANOS: u64> {
     current: Span,
     previous: Span,
     epoch: Timestamp,
 }
 
-impl<const WINDOW_NANOS: u64> WindowedMin<WINDOW_NANOS> {
-    const HALF_WINDOW: Span = Span::from_nanos(WINDOW_NANOS / 2);
+impl<const NANOS: u64> WindowedMin<NANOS> {
+    const HALF_WINDOW: Span = Span::from_nanos(NANOS / 2);
 
     fn new(now: Timestamp, sample: Span) -> Self {
-        const { assert!(WINDOW_NANOS > 1, "a windowed minimum needs a window to roll over") };
+        const { assert!(NANOS > 1, "a windowed minimum needs a window to roll over") };
         Self { current: sample, previous: sample, epoch: now }
     }
 
@@ -345,8 +345,8 @@ impl<P, const N: usize> Delivery<P, N> {
             // Updated here rather than by the caller, so the timestamp and the
             // decision to track the packet cannot disagree.
             self.last_eliciting = now;
-            let sent = Sent { sent_at: now, state: State::InFlight(record) };
             self.in_flight += 1;
+            let sent = Sent { sent_at: now, state: State::InFlight(record) };
 
             if let Some((_, evicted)) = self.sent.insert(sequence, sent)
                 && let State::InFlight(record) = evicted.state

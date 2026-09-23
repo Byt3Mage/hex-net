@@ -72,10 +72,10 @@ fn a_crowd_of_players_is_served_without_loss() {
 }
 
 /// The full target: a thousand players at once. Slow in a debug build, so it
-/// is run on request:
+/// is run on request or when in release:
 /// `cargo test --release -p hex-net-sim -- --ignored --nocapture`
 #[test]
-#[ignore = "takes about a minute unless built with --release"]
+#[cfg_attr(debug_assertions, ignore = "takes about a minute unless built with --release")]
 fn a_thousand_players_are_served_without_loss() {
     const CLIENTS: usize = 1000;
     const TOTAL: u32 = 40;

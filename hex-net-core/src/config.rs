@@ -1,13 +1,9 @@
 //! Everything the transport is tuned by, in one place.
 //!
-//! Three kinds of value live here:
+//! Three kinds of value are defined here:
 //! - [BudgetConfig]: What one side chooses for itself
 //! - [MaxAckDelay]: What both sides must agree on
 //! - [Liveness]: How long a connection may be silent before it is considered gone
-//!
-//! Every type here is built through a `const fn` that rejects the combinations
-//! that would misbehave, so a configuration that cannot work cannot be
-//! constructed, and a constant one fails the build rather than a run.
 
 use crate::{
     channel::{MAX_MESSAGE, MESSAGE_FRAME_OVERHEAD},
@@ -47,8 +43,8 @@ impl BudgetConfig {
     /// a whole message or exceeds what the wire allows.
     pub const fn new(rate: u32, max_packet: usize) -> Option<BudgetConfig> {
         const { assert!(MIN_PACKET <= MAX_DATAGRAM, "a full message must fit one datagram") };
-        const { assert!(MAX_DATAGRAM <= (u16::MAX as usize)) };
-        if (rate < MIN_RATE) || (max_packet < MIN_PACKET) || (max_packet > MAX_DATAGRAM) {
+        const { assert!(MAX_DATAGRAM <= u16::MAX as usize) };
+        if rate < MIN_RATE || max_packet < MIN_PACKET || max_packet > MAX_DATAGRAM {
             return None;
         }
         Some(BudgetConfig { rate, max_packet: max_packet as u16 })

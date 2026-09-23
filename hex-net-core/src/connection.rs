@@ -1,10 +1,10 @@
 //! One peer's state machine, parameterised by which side of it we are.
 //!
-//! Everything that differs between the two sides is either associated state on
+//! Everything different between the two sides is either associated state on
 //! the role or an inherent method on one instantiation, so a client connection
 //! has no path-validation state and a server connection has no received ticket.
 //!
-//! One rule holds the file together: `transmit_at` is the only judgement of
+//! One rule holds controls the flow: `transmit_at` is the only judgement of
 //! whether a packet is owed. `poll_transmit` builds exactly when it is due and
 //! `next_timeout` reports it, so a deadline that has come always produces a
 //! packet and a driver woken by one cannot spin.
@@ -124,25 +124,69 @@ enum AckOwed {
     AtOnce,
 }
 
-impl AckOwed {
+/// What this side owes in acknowledgements, and when it may spend a packet of
+/// its own on one.
+#[derive(Clone, Copy, Debug)]
+struct Acks {
+    owed: AckOwed,
+    /// Longest an acknowledgement is held for a packet with frames to carry
+    /// it, and the shortest gap between two packets carrying nothing else.
+    delay: Span,
+    /// Earliest the next acknowledgement may go out alone.
+    ///
+    /// Without it, a run of loss costs one packet per arrival: every datagram
+    /// behind a gap arrives out of order, so every one would be due at once.
+    /// The peer acts on a gap once per round of retransmission decisions, so
+    /// telling it more often buys nothing and costs the most when the path can
+    /// least afford it.
+    alone_after: Timestamp,
+}
+
+impl Acks {
+    fn new(delay: Span) -> Acks {
+        Acks {
+            owed: AckOwed::Nothing,
+            delay,
+            alone_after: Timestamp::ZERO,
+        }
+    }
+
     /// Records an arriving ack-eliciting packet. The first one starts the
     /// holding period; one out of order ends it.
     #[inline]
     fn record(&mut self, now: Timestamp, in_order: bool) {
-        *self = match (*self, in_order) {
+        self.owed = match (self.owed, in_order) {
             (_, false) | (AckOwed::AtOnce, _) => AckOwed::AtOnce,
             (AckOwed::Nothing, true) => AckOwed::Held(now),
             (held, true) => held,
         };
     }
 
-    /// When this acknowledgement must go out even with nothing to carry it.
+    /// When what is owed must go out even with nothing to carry it.
     #[inline]
-    fn deadline(self, delay: Span) -> Option<Timestamp> {
-        match self {
-            AckOwed::Nothing => None,
-            AckOwed::AtOnce => Some(Timestamp::ZERO),
-            AckOwed::Held(since) => Some(since.saturating_add(delay)),
+    fn deadline(&self) -> Option<Timestamp> {
+        let ready = match self.owed {
+            AckOwed::Nothing => return None,
+            AckOwed::AtOnce => Timestamp::ZERO,
+            AckOwed::Held(since) => since.saturating_add(self.delay),
+        };
+        Some(ready.max(self.alone_after))
+    }
+
+    /// An acknowledgement is owed and has been held as long as it may be.
+    #[inline]
+    fn due(&self, now: Timestamp) -> bool {
+        self.deadline().is_some_and(|at| at <= now)
+    }
+
+    /// A packet went out carrying the whole acknowledgement state, so nothing
+    /// is owed. One that carried nothing else also starts the gap before
+    /// another may.
+    #[inline]
+    fn sent(&mut self, now: Timestamp, eliciting: bool) {
+        self.owed = AckOwed::Nothing;
+        if !eliciting {
+            self.alone_after = now.saturating_add(self.delay);
         }
     }
 }
@@ -366,9 +410,8 @@ pub struct Connection<R: Role> {
     channels: Channels,
     control: ControlQueue,
 
-    ack: AckOwed,
-    /// Longest an acknowledgement is held for a packet with frames to carry it.
-    ack_delay: Span,
+    acks: Acks,
+
     /// How long silence may last, and how often it is broken.
     liveness: Liveness,
 
@@ -404,8 +447,7 @@ impl<R: Role> Connection<R> {
             budget: Budget::new(now, transport.budget),
             channels: Channels::new(channels),
             control: ControlQueue::new(control),
-            ack: AckOwed::Nothing,
-            ack_delay: transport.max_ack_delay.get(),
+            acks: Acks::new(transport.max_ack_delay.get()),
             liveness: transport.liveness,
             last_received: now,
             pending_probes: 0,
@@ -520,7 +562,7 @@ impl<R: Role> Connection<R> {
 
         if eliciting {
             self.crypto.record_eliciting(opened.sequence, ctx.now);
-            self.ack.record(ctx.now, opened.in_order);
+            self.acks.record(ctx.now, opened.in_order);
         }
 
         if from != self.addr {
@@ -590,7 +632,7 @@ impl<R: Role> Connection<R> {
             return Some(Timestamp::ZERO);
         }
 
-        let ack = self.ack.deadline(self.ack_delay);
+        let ack = self.acks.deadline();
 
         // Only an open connection writes channel frames, so only an open one is
         // woken to send them. The message that goes first is the only one that
@@ -659,7 +701,7 @@ impl<R: Role> Connection<R> {
             eliciting |= self.channels.write_frames(&mut w, &mut staged, channel_limit);
         }
 
-        if !eliciting && !self.ack_due(ctx.now) {
+        if !eliciting && !self.acks.due(ctx.now) {
             // The packet would carry a header and a tag and nothing else, which
             // the peer cannot act on. Whatever is owed stays owed.
             self.channels.on_packet_aborted(staged);
@@ -683,7 +725,7 @@ impl<R: Role> Connection<R> {
         self.budget.on_sent(sealed.datagram_len(), eliciting);
         // Every header reports the whole ack state,
         // so anything owed has now gone out.
-        self.ack = AckOwed::Nothing;
+        self.acks.sent(ctx.now, eliciting);
 
         if eliciting {
             ctx.counters.inc(Counter::PacketsTracked);
@@ -704,12 +746,6 @@ impl<R: Role> Connection<R> {
         Some(len)
     }
 
-    /// An acknowledgement is owed and has been held as long as it may be.
-    #[inline]
-    fn ack_due(&self, now: Timestamp) -> bool {
-        self.ack.deadline(self.ack_delay).is_some_and(|at| at <= now)
-    }
-
     fn build_header(&self, now: Timestamp, sequence: Sequence) -> Header {
         let (ack, ack_delay, ack_bits) = match self.crypto.ack_state() {
             Some(state) => (
@@ -719,6 +755,7 @@ impl<R: Role> Connection<R> {
             ),
             None => (None, 0, 0),
         };
+
         Header {
             kind: PacketKind::Payload,
             conn_id: self.id,
